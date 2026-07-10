@@ -47,6 +47,7 @@ private:
   bool exprHasCall(const Expr &expr) const;
   std::string allocVarReg();
   bool hasVarRegs() const;
+  std::string tempRegName(int depth) const;
   void emit(const std::string &line);
   void emitData(const Program &program);
   void emitFunction(const Function &fn);

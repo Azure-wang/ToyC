@@ -29,6 +29,11 @@ std::string RiscV32CodeGen::allocVarReg() {
   return "s" + std::to_string(1 + nextVarReg_++);
 }
 
+std::string RiscV32CodeGen::tempRegName(int depth) const {
+  if (depth < 7) return "t" + std::to_string(depth);
+  return "a" + std::to_string(depth - 6);
+}
+
 std::string RiscV32CodeGen::generate(const Program &program) {
   symbols_.push();
   emitData(program);
@@ -252,8 +257,35 @@ void RiscV32CodeGen::emitStmt(const Stmt &stmt) {
   } else if (dynamic_cast<const ContinueStmt *>(&stmt)) {
     emit("j " + loops_.back().cont);
   } else if (auto *ret = dynamic_cast<const ReturnStmt *>(&stmt)) {
-    if (ret->value) emitExpr(*ret->value);
-    else emit("li a0, 0");
+    if (ret->value) {
+      if (optimize_ && dynamic_cast<const CallExpr *>(ret->value.get())) {
+        const auto &call = dynamic_cast<const CallExpr &>(*ret->value);
+        for (int i = static_cast<int>(call.args.size()) - 1; i >= 0; --i) {
+          emitExpr(*call.args[static_cast<size_t>(i)]);
+          emit("addi sp, sp, -4");
+          emit("sw a0, 0(sp)");
+        }
+        int n = static_cast<int>(call.args.size());
+        int regArgs = std::min(n, 8);
+        for (int i = 0; i < regArgs; ++i)
+          emit("lw a" + std::to_string(i) + ", " + std::to_string(i * 4) + "(sp)");
+        if (regArgs > 0) emit("addi sp, sp, " + std::to_string(regArgs * 4));
+        int extra = n - regArgs;
+        if (extra > 0) emit("addi sp, sp, " + std::to_string(extra * 4));
+        for (int i = savedSRegs_ - 1; i >= 0; --i) {
+          int slot = currentLeaf_ ? (8 + i * 4) : (12 + i * 4);
+          emit("lw s" + std::to_string(i + 1) + ", -" + std::to_string(slot) + "(s0)");
+        }
+        if (!currentLeaf_) emit("lw ra, -4(s0)");
+        emit("lw s0, -" + std::to_string(currentLeaf_ ? 4 : 8) + "(s0)");
+        emit("addi sp, sp, " + std::to_string(frameSize_));
+        emit("j " + call.callee);
+        return;
+      }
+      emitExpr(*ret->value);
+    } else {
+      emit("li a0, 0");
+    }
     emit("j " + currentReturnLabel_);
   }
 }
@@ -328,12 +360,68 @@ void RiscV32CodeGen::emitExpr(const Expr &expr) {
           if (*rhsConst != 0) emit("addi a0, a0, " + std::to_string(-*rhsConst));
           return;
         }
+        if (bin->op == BinaryOp::Mul) {
+          int32_t c = *rhsConst;
+          if (c == 0) { emit("li a0, 0"); return; }
+          if (c == 1) { emitExpr(*bin->lhs); return; }
+          if (c == -1) { emitExpr(*bin->lhs); emit("neg a0, a0"); return; }
+          if ((c & (c - 1)) == 0) {
+            int k = 0;
+            uint32_t u = static_cast<uint32_t>(c);
+            while (u > 1) { u >>= 1; ++k; }
+            emitExpr(*bin->lhs);
+            emit("slli a0, a0, " + std::to_string(k));
+            return;
+          }
+          emitExpr(*bin->lhs);
+          emit("mv t0, a0");
+          switch (c) {
+          case 3:  emit("slli a0, a0, 1"); emit("add a0, a0, t0"); return;
+          case 5:  emit("slli a0, a0, 2"); emit("add a0, a0, t0"); return;
+          case 6:  emit("slli a0, a0, 2"); emit("add a0, a0, t0");
+                   emit("add a0, a0, t0"); return;
+          case 7:  emit("slli a0, a0, 3"); emit("sub a0, a0, t0"); return;
+          case 9:  emit("slli a0, a0, 3"); emit("add a0, a0, t0"); return;
+          case 10: emit("slli a0, a0, 3"); emit("add a0, a0, t0");
+                   emit("add a0, a0, t0"); return;
+          default: break;
+          }
+        }
+        if (bin->op == BinaryOp::Mul) {
+          if (auto lhsConst = evalConst(*bin->lhs)) {
+            int32_t c = *lhsConst;
+            if (c == 0) { emit("li a0, 0"); return; }
+            if (c == 1) { emitExpr(*bin->rhs); return; }
+            if (c == -1) { emitExpr(*bin->rhs); emit("neg a0, a0"); return; }
+            if ((c & (c - 1)) == 0) {
+              int k = 0;
+              uint32_t u = static_cast<uint32_t>(c);
+              while (u > 1) { u >>= 1; ++k; }
+              emitExpr(*bin->rhs);
+              emit("slli a0, a0, " + std::to_string(k));
+              return;
+            }
+            emitExpr(*bin->rhs);
+            emit("mv t0, a0");
+            switch (c) {
+            case 3:  emit("slli a0, a0, 1"); emit("add a0, a0, t0"); return;
+            case 5:  emit("slli a0, a0, 2"); emit("add a0, a0, t0"); return;
+            case 6:  emit("slli a0, a0, 2"); emit("add a0, a0, t0");
+                     emit("add a0, a0, t0"); return;
+            case 7:  emit("slli a0, a0, 3"); emit("sub a0, a0, t0"); return;
+            case 9:  emit("slli a0, a0, 3"); emit("add a0, a0, t0"); return;
+            case 10: emit("slli a0, a0, 3"); emit("add a0, a0, t0");
+                     emit("add a0, a0, t0"); return;
+            default: break;
+            }
+          }
+        }
       }
     }
     std::string lhsReg = "t0";
-    bool useTempReg = optimize_ && !exprHasCall(*bin->rhs) && tempDepth_ < 7;
+    bool useTempReg = optimize_ && !exprHasCall(*bin->rhs) && tempDepth_ < 13;
     if (useTempReg) {
-      lhsReg = "t" + std::to_string(tempDepth_++);
+      lhsReg = tempRegName(tempDepth_++);
       emitExpr(*bin->lhs);
       emit("mv " + lhsReg + ", a0");
       emitExpr(*bin->rhs);
@@ -393,9 +481,9 @@ void RiscV32CodeGen::emitCondition(const Expr &expr, const std::string &trueLabe
     if (bin->op == BinaryOp::Lt || bin->op == BinaryOp::Gt || bin->op == BinaryOp::Le ||
         bin->op == BinaryOp::Ge || bin->op == BinaryOp::Eq || bin->op == BinaryOp::Ne) {
       std::string lhsReg = "t0";
-      bool useTempReg = optimize_ && !exprHasCall(*bin->rhs) && tempDepth_ < 7;
+      bool useTempReg = optimize_ && !exprHasCall(*bin->rhs) && tempDepth_ < 13;
       if (useTempReg) {
-        lhsReg = "t" + std::to_string(tempDepth_++);
+        lhsReg = tempRegName(tempDepth_++);
         emitExpr(*bin->lhs);
         emit("mv " + lhsReg + ", a0");
         emitExpr(*bin->rhs);
