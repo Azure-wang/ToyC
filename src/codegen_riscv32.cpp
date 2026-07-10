@@ -349,6 +349,28 @@ void RiscV32CodeGen::emitExpr(const Expr &expr) {
       return;
     }
     if (optimize_) {
+      if (auto lhsConst = evalConst(*bin->lhs)) {
+        if (bin->op == BinaryOp::Sub) {
+          emitExpr(*bin->rhs);
+          emit("neg a0, a0");
+          if (*lhsConst != 0) emit("addi a0, a0, " + std::to_string(*lhsConst));
+          return;
+        }
+        if (bin->op == BinaryOp::Mul) {
+          int32_t c = *lhsConst;
+          if (c == 0) { emit("li a0, 0"); return; }
+          if (c == 1) { emitExpr(*bin->rhs); return; }
+          if (c == -1) { emitExpr(*bin->rhs); emit("neg a0, a0"); return; }
+          if ((c & (c - 1)) == 0) {
+            int k = 0;
+            uint32_t u = static_cast<uint32_t>(c);
+            while (u > 1) { u >>= 1; ++k; }
+            emitExpr(*bin->rhs);
+            emit("slli a0, a0, " + std::to_string(k));
+            return;
+          }
+        }
+      }
       if (auto rhsConst = evalConst(*bin->rhs)) {
         if (bin->op == BinaryOp::Add && *rhsConst >= -2048 && *rhsConst <= 2047) {
           emitExpr(*bin->lhs);
@@ -373,47 +395,24 @@ void RiscV32CodeGen::emitExpr(const Expr &expr) {
             emit("slli a0, a0, " + std::to_string(k));
             return;
           }
-          emitExpr(*bin->lhs);
-          emit("mv t0, a0");
-          switch (c) {
-          case 3:  emit("slli a0, a0, 1"); emit("add a0, a0, t0"); return;
-          case 5:  emit("slli a0, a0, 2"); emit("add a0, a0, t0"); return;
-          case 6:  emit("slli a0, a0, 2"); emit("add a0, a0, t0");
-                   emit("add a0, a0, t0"); return;
-          case 7:  emit("slli a0, a0, 3"); emit("sub a0, a0, t0"); return;
-          case 9:  emit("slli a0, a0, 3"); emit("add a0, a0, t0"); return;
-          case 10: emit("slli a0, a0, 3"); emit("add a0, a0, t0");
-                   emit("add a0, a0, t0"); return;
-          default: break;
-          }
         }
-        if (bin->op == BinaryOp::Mul) {
-          if (auto lhsConst = evalConst(*bin->lhs)) {
-            int32_t c = *lhsConst;
-            if (c == 0) { emit("li a0, 0"); return; }
-            if (c == 1) { emitExpr(*bin->rhs); return; }
-            if (c == -1) { emitExpr(*bin->rhs); emit("neg a0, a0"); return; }
-            if ((c & (c - 1)) == 0) {
-              int k = 0;
-              uint32_t u = static_cast<uint32_t>(c);
-              while (u > 1) { u >>= 1; ++k; }
-              emitExpr(*bin->rhs);
+        if (bin->op == BinaryOp::Div || bin->op == BinaryOp::Mod) {
+          int32_t c = *rhsConst;
+          if (c > 0 && (c & (c - 1)) == 0) {
+            int k = 0;
+            uint32_t u = static_cast<uint32_t>(c);
+            while (u > 1) { u >>= 1; ++k; }
+            emitExpr(*bin->lhs);
+            if (bin->op == BinaryOp::Mod) emit("mv t1, a0");
+            emit("srai t0, a0, 31");
+            emit("srli t0, t0, " + std::to_string(32 - k));
+            emit("add a0, a0, t0");
+            emit("srai a0, a0, " + std::to_string(k));
+            if (bin->op == BinaryOp::Mod) {
               emit("slli a0, a0, " + std::to_string(k));
-              return;
+              emit("sub a0, t1, a0");
             }
-            emitExpr(*bin->rhs);
-            emit("mv t0, a0");
-            switch (c) {
-            case 3:  emit("slli a0, a0, 1"); emit("add a0, a0, t0"); return;
-            case 5:  emit("slli a0, a0, 2"); emit("add a0, a0, t0"); return;
-            case 6:  emit("slli a0, a0, 2"); emit("add a0, a0, t0");
-                     emit("add a0, a0, t0"); return;
-            case 7:  emit("slli a0, a0, 3"); emit("sub a0, a0, t0"); return;
-            case 9:  emit("slli a0, a0, 3"); emit("add a0, a0, t0"); return;
-            case 10: emit("slli a0, a0, 3"); emit("add a0, a0, t0");
-                     emit("add a0, a0, t0"); return;
-            default: break;
-            }
+            return;
           }
         }
       }

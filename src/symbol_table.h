@@ -37,6 +37,13 @@ public:
     return nullptr;
   }
 
+  bool invalidate(const std::string &name) {
+    for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
+      if (it->erase(name)) return true;
+    }
+    return false;
+  }
+
 private:
   std::vector<std::unordered_map<std::string, T>> scopes_;
 };

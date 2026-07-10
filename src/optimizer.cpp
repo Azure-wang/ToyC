@@ -139,16 +139,57 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr) {
       expr = std::move(un->operand);
       return true;
     }
+    if (un->op == UnaryOp::Minus) {
+      if (auto *inner = dynamic_cast<UnaryExpr *>(un->operand.get())) {
+        if (inner->op == UnaryOp::Minus) {
+          expr = std::move(inner->operand);
+          return true;
+        }
+      }
+    }
     return false;
   }
   if (auto *bin = dynamic_cast<BinaryExpr *>(expr.get())) {
     foldExpr(bin->lhs);
     foldExpr(bin->rhs);
+    if (bin->op == BinaryOp::Add) {
+      if (auto *rhsNeg = dynamic_cast<UnaryExpr *>(bin->rhs.get())) {
+        if (rhsNeg->op == UnaryOp::Minus) {
+          bin->op = BinaryOp::Sub;
+          bin->rhs = std::move(rhsNeg->operand);
+          foldExpr(expr);
+          return true;
+        }
+      }
+      if (auto *lhsNeg = dynamic_cast<UnaryExpr *>(bin->lhs.get())) {
+        if (lhsNeg->op == UnaryOp::Minus) {
+          bin->op = BinaryOp::Sub;
+          bin->lhs = std::move(bin->rhs);
+          bin->rhs = std::move(lhsNeg->operand);
+          foldExpr(expr);
+          return true;
+        }
+      }
+    }
     int32_t a = 0, b = 0;
     bool hasA = number(*bin->lhs, a);
     bool hasB = number(*bin->rhs, b);
     if (hasA && hasB) {
       expr = std::make_unique<NumberExpr>(bin->loc, applyBinary(bin->op, a, b));
+      return true;
+    }
+    if ((bin->op == BinaryOp::Mul || bin->op == BinaryOp::Add) && hasA && !hasB) {
+      std::swap(bin->lhs, bin->rhs);
+      std::swap(a, b);
+      std::swap(hasA, hasB);
+    }
+    if (hasA && !hasB && bin->op == BinaryOp::Sub) {
+      // C - x → (-x) + C
+      auto x = std::move(bin->rhs);
+      auto neg = std::make_unique<UnaryExpr>(bin->loc, UnaryOp::Minus, std::move(x));
+      expr = std::make_unique<BinaryExpr>(bin->loc, BinaryOp::Add,
+          std::move(neg), std::move(bin->lhs));
+      foldExpr(expr);
       return true;
     }
     if (bin->op == BinaryOp::Add && hasB && b == 0) expr = std::move(bin->lhs);
@@ -159,8 +200,54 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr) {
     else if (bin->op == BinaryOp::Mul && ((hasA && a == 0) || (hasB && b == 0))) expr = std::make_unique<NumberExpr>(bin->loc, 0);
     else if (bin->op == BinaryOp::Div && hasB && b == 1) expr = std::move(bin->lhs);
     else if (bin->op == BinaryOp::Mod && hasB && b == 1) expr = std::make_unique<NumberExpr>(bin->loc, 0);
-    else return false;
-    return true;
+    else if (bin->op == BinaryOp::Sub) {
+      if (auto *lv = dynamic_cast<VarExpr *>(bin->lhs.get())) {
+        if (auto *rv = dynamic_cast<VarExpr *>(bin->rhs.get())) {
+          if (lv->name == rv->name) { expr = std::make_unique<NumberExpr>(bin->loc, 0); return true; }
+        }
+      }
+    }
+    if (hasB) {
+      if (auto *inner = dynamic_cast<BinaryExpr *>(bin->lhs.get())) {
+        int32_t c = 0;
+        if ((inner->op == BinaryOp::Add || inner->op == BinaryOp::Sub)
+            && number(*inner->rhs, c)) {
+          if (bin->op == BinaryOp::Add || bin->op == BinaryOp::Sub) {
+            int32_t d = (bin->op == BinaryOp::Add)
+                ? ((inner->op == BinaryOp::Add) ? (c + b) : (b - c))
+                : ((inner->op == BinaryOp::Add) ? (c - b) : (-c - b));
+            auto x = std::move(inner->lhs);
+            if (d == 0) expr = std::move(x);
+            else if (d > 0)
+              expr = std::make_unique<BinaryExpr>(bin->loc, BinaryOp::Add,
+                  std::move(x), std::make_unique<NumberExpr>(bin->loc, d));
+            else
+              expr = std::make_unique<BinaryExpr>(bin->loc, BinaryOp::Sub,
+                  std::move(x), std::make_unique<NumberExpr>(bin->loc, -d));
+            return true;
+          }
+        }
+      }
+    }
+    if (hasA && bin->op == BinaryOp::Add) {
+      if (auto *inner = dynamic_cast<BinaryExpr *>(bin->rhs.get())) {
+        int32_t c = 0;
+        if ((inner->op == BinaryOp::Add || inner->op == BinaryOp::Sub)
+            && number(*inner->rhs, c)) {
+          int32_t d = (inner->op == BinaryOp::Add) ? (a + c) : (a - c);
+          auto x = std::move(inner->lhs);
+          if (d == 0) expr = std::move(x);
+          else if (d > 0)
+            expr = std::make_unique<BinaryExpr>(bin->loc, BinaryOp::Add,
+                std::move(x), std::make_unique<NumberExpr>(bin->loc, d));
+          else
+            expr = std::make_unique<BinaryExpr>(bin->loc, BinaryOp::Sub,
+                std::move(x), std::make_unique<NumberExpr>(bin->loc, -d));
+          return true;
+        }
+      }
+    }
+    return false;
   }
   return false;
 }
@@ -556,11 +643,6 @@ void Optimizer::hoistLoopInvariants(BlockStmt &block) {
       std::vector<std::unique_ptr<Stmt>> keptBody;
       for (auto &bs : body->stmts) {
         if (isInvariant(*bs, mustSet)) {
-          if (auto *decl = dynamic_cast<DeclStmt *>(bs.get())) {
-            if (!decl->decl.isConst) mustSet.erase(decl->decl.name);
-          } else if (auto *assign = dynamic_cast<AssignStmt *>(bs.get())) {
-            mustSet.erase(assign->name);
-          }
           newStmts.push_back(std::move(bs));
         } else {
           keptBody.push_back(std::move(bs));
@@ -683,6 +765,8 @@ static void renameInStmt(Stmt &stmt,
   if (auto *block = dynamic_cast<BlockStmt *>(&stmt)) {
     for (auto &s : block->stmts) renameInStmt(*s, rmap);
   } else if (auto *decl = dynamic_cast<DeclStmt *>(&stmt)) {
+    auto it = rmap.find(decl->decl.name);
+    if (it != rmap.end()) decl->decl.name = it->second;
     renameInExpr(*decl->decl.init, rmap);
   } else if (auto *es = dynamic_cast<ExprStmt *>(&stmt)) {
     renameInExpr(*es->expr, rmap);
@@ -754,13 +838,6 @@ std::unique_ptr<Expr> Optimizer::inlineInExpr(std::unique_ptr<Expr> expr,
       auto &lastStmt = cloned->stmts.back();
       ReturnStmt *ret = dynamic_cast<ReturnStmt *>(lastStmt.get());
       std::string retName = prefix + "ret";
-      {
-        Decl d;
-        d.loc = loc;
-        d.name = retName;
-        d.init = std::make_unique<NumberExpr>(loc, 0);
-        preStmts.push_back(std::make_unique<DeclStmt>(loc, std::move(d)));
-      }
       for (size_t i = 0; i < fn.params.size(); ++i) {
         Decl d;
         d.loc = loc;
@@ -770,9 +847,14 @@ std::unique_ptr<Expr> Optimizer::inlineInExpr(std::unique_ptr<Expr> expr,
       }
       for (size_t i = 0; i + 1 < cloned->stmts.size(); ++i)
         preStmts.push_back(std::move(cloned->stmts[i]));
-      if (ret && ret->value)
-        preStmts.push_back(std::make_unique<AssignStmt>(
-            ret->loc, retName, std::move(ret->value)));
+      {
+        Decl d;
+        d.loc = loc;
+        d.name = retName;
+        d.init = (ret && ret->value) ? std::move(ret->value)
+            : std::unique_ptr<Expr>(std::make_unique<NumberExpr>(loc, 0));
+        preStmts.push_back(std::make_unique<DeclStmt>(loc, std::move(d)));
+      }
       return std::make_unique<VarExpr>(loc, retName);
     }
   }
