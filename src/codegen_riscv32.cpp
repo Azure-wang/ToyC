@@ -33,6 +33,8 @@ std::string RiscV32CodeGen::generate(const Program &program) {
   symbols_.push();
   emitData(program);
   text_ << ".section .text\n";
+  text_ << ".globl main\n";
+  text_ << ".weak _start\n";
   text_ << ".globl _start\n";
   text_ << "_start:\n";
   emit("call main");
