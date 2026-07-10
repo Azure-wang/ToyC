@@ -77,6 +77,7 @@ private:
   int tempDepth_ = 0;
   bool currentLeaf_ = false;
   std::string currentReturnLabel_;
+  std::unordered_map<int, std::string> loadedAtDepth_;
 };
 
 } // namespace toyc

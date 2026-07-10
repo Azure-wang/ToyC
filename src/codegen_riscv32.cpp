@@ -216,6 +216,7 @@ void RiscV32CodeGen::emitBlock(const BlockStmt &block, bool createScope) {
 }
 
 void RiscV32CodeGen::emitStmt(const Stmt &stmt) {
+  loadedAtDepth_.clear();
   if (auto *block = dynamic_cast<const BlockStmt *>(&stmt)) emitBlock(*block, true);
   else if (auto *decl = dynamic_cast<const DeclStmt *>(&stmt)) emitDecl(decl->decl);
   else if (auto *expr = dynamic_cast<const ExprStmt *>(&stmt)) emitExpr(*expr->expr);
@@ -223,6 +224,80 @@ void RiscV32CodeGen::emitStmt(const Stmt &stmt) {
     Symbol *sym = lookup(assign->name);
     if (!sym) error(assign->loc, "unknown variable '" + assign->name + "'");
     if (sym->isConst) error(assign->loc, "cannot assign const");
+    if (optimize_ && !sym->reg.empty()) {
+      if (auto *bin = dynamic_cast<BinaryExpr *>(assign->value.get())) {
+        if (auto *lv = dynamic_cast<VarExpr *>(bin->lhs.get())) {
+          if (lv->name == assign->name) {
+            if (auto c = evalConst(*bin->rhs)) {
+              if (bin->op == BinaryOp::Add && *c >= -2048 && *c <= 2047) {
+                if (*c != 0) emit("addi " + sym->reg + ", " + sym->reg + ", " + std::to_string(*c));
+                return;
+              }
+              if (bin->op == BinaryOp::Sub && *c >= -2047 && *c <= 2048) {
+                if (*c != 0) emit("addi " + sym->reg + ", " + sym->reg + ", " + std::to_string(-*c));
+                return;
+              }
+              if (bin->op == BinaryOp::Mul) {
+                int32_t cv = *c;
+                if (cv == 0) { emit("li " + sym->reg + ", 0"); return; }
+                if (cv == 1) return;
+                if (cv == -1) { emit("neg " + sym->reg + ", " + sym->reg); return; }
+                if ((cv & (cv - 1)) == 0) {
+                  int k = 0; uint32_t u = static_cast<uint32_t>(cv);
+                  while (u > 1) { u >>= 1; ++k; }
+                  emit("slli " + sym->reg + ", " + sym->reg + ", " + std::to_string(k));
+                  return;
+                }
+                if (cv == 3) {
+                  emit("slli t0, " + sym->reg + ", 1");
+                  emit("add " + sym->reg + ", " + sym->reg + ", t0");
+                  return;
+                }
+                if (cv == 5) {
+                  emit("slli t0, " + sym->reg + ", 2");
+                  emit("add " + sym->reg + ", " + sym->reg + ", t0");
+                  return;
+                }
+                if (cv == 7) {
+                  emit("slli t0, " + sym->reg + ", 3");
+                  emit("sub " + sym->reg + ", t0, " + sym->reg);
+                  return;
+                }
+                if (cv == 9) {
+                  emit("slli t0, " + sym->reg + ", 3");
+                  emit("add " + sym->reg + ", " + sym->reg + ", t0");
+                  return;
+                }
+              }
+            }
+            if (!exprHasCall(*bin->rhs) && tempDepth_ < 13) {
+              std::string tReg = tempRegName(tempDepth_++);
+              if (auto *rv = dynamic_cast<VarExpr *>(bin->rhs.get())) {
+                Symbol *rs = lookup(rv->name);
+                if (rs) {
+                  if (rs->constValue) emit("li " + tReg + ", " + std::to_string(*rs->constValue));
+                  else if (!rs->reg.empty()) emit("mv " + tReg + ", " + rs->reg);
+                  else emit("lw " + tReg + ", " + std::to_string(rs->offset) + "(s0)");
+                }
+              } else {
+                emitExpr(*bin->rhs);
+                emit("mv " + tReg + ", a0");
+              }
+              tempDepth_--;
+              switch (bin->op) {
+              case BinaryOp::Add: emit("add " + sym->reg + ", " + sym->reg + ", " + tReg); break;
+              case BinaryOp::Sub: emit("sub " + sym->reg + ", " + sym->reg + ", " + tReg); break;
+              case BinaryOp::Mul: emit("mul " + sym->reg + ", " + sym->reg + ", " + tReg); break;
+              case BinaryOp::Div: emit("div " + sym->reg + ", " + sym->reg + ", " + tReg); break;
+              case BinaryOp::Mod: emit("rem " + sym->reg + ", " + sym->reg + ", " + tReg); break;
+              default: emitExpr(*assign->value); storeTo(*sym, assign->loc); break;
+              }
+              return;
+            }
+          }
+        }
+      }
+    }
     emitExpr(*assign->value);
     storeTo(*sym, assign->loc);
   } else if (auto *ifs = dynamic_cast<const IfStmt *>(&stmt)) {
@@ -244,7 +319,6 @@ void RiscV32CodeGen::emitStmt(const Stmt &stmt) {
     std::string bodyL = label("while_body");
     std::string endL = label("while_end");
     loops_.push_back(LoopLabels{condL, endL});
-    emit("j " + condL);
     text_ << condL << ":\n";
     emitCondition(*wh->cond, bodyL, endL);
     text_ << bodyL << ":\n";
@@ -306,8 +380,22 @@ void RiscV32CodeGen::emitDecl(const Decl &decl) {
     nextOffset_ -= 4;
   }
   if (!symbols_.declare(decl.name, sym)) error(decl.loc, "duplicate declaration");
-  emitExpr(*decl.init);
-  storeTo(sym, decl.loc);
+  if (optimize_ && dynamic_cast<NumberExpr *>(decl.init.get())) {
+    auto val = static_cast<NumberExpr *>(decl.init.get())->value;
+    if (!sym.reg.empty())
+      emit("li " + sym.reg + ", " + std::to_string(val));
+    else if (sym.isGlobal) {
+      emit("la t0, " + sym.label);
+      emit("li t1, " + std::to_string(val));
+      emit("sw t1, 0(t0)");
+    } else {
+      emit("li t0, " + std::to_string(val));
+      emit("sw t0, " + std::to_string(sym.offset) + "(s0)");
+    }
+  } else {
+    emitExpr(*decl.init);
+    storeTo(sym, decl.loc);
+  }
 }
 
 void RiscV32CodeGen::emitExpr(const Expr &expr) {
@@ -369,6 +457,30 @@ void RiscV32CodeGen::emitExpr(const Expr &expr) {
             emit("slli a0, a0, " + std::to_string(k));
             return;
           }
+          if (c == 3) {
+            emitExpr(*bin->rhs);
+            emit("slli t0, a0, 1");
+            emit("add a0, a0, t0");
+            return;
+          }
+          if (c == 5) {
+            emitExpr(*bin->rhs);
+            emit("slli t0, a0, 2");
+            emit("add a0, a0, t0");
+            return;
+          }
+          if (c == 7) {
+            emitExpr(*bin->rhs);
+            emit("slli t0, a0, 3");
+            emit("sub a0, t0, a0");
+            return;
+          }
+          if (c == 9) {
+            emitExpr(*bin->rhs);
+            emit("slli t0, a0, 3");
+            emit("add a0, a0, t0");
+            return;
+          }
         }
       }
       if (auto rhsConst = evalConst(*bin->rhs)) {
@@ -395,6 +507,30 @@ void RiscV32CodeGen::emitExpr(const Expr &expr) {
             emit("slli a0, a0, " + std::to_string(k));
             return;
           }
+          if (c == 3) {
+            emitExpr(*bin->lhs);
+            emit("slli t0, a0, 1");
+            emit("add a0, a0, t0");
+            return;
+          }
+          if (c == 5) {
+            emitExpr(*bin->lhs);
+            emit("slli t0, a0, 2");
+            emit("add a0, a0, t0");
+            return;
+          }
+          if (c == 7) {
+            emitExpr(*bin->lhs);
+            emit("slli t0, a0, 3");
+            emit("sub a0, t0, a0");
+            return;
+          }
+          if (c == 9) {
+            emitExpr(*bin->lhs);
+            emit("slli t0, a0, 3");
+            emit("add a0, a0, t0");
+            return;
+          }
         }
         if (bin->op == BinaryOp::Div || bin->op == BinaryOp::Mod) {
           int32_t c = *rhsConst;
@@ -413,6 +549,101 @@ void RiscV32CodeGen::emitExpr(const Expr &expr) {
               emit("sub a0, t1, a0");
             }
             return;
+          }
+        }
+      }
+      if (auto *var = dynamic_cast<const VarExpr *>(bin->lhs.get())) {
+        if (Symbol *sym = lookup(var->name)) {
+          if (auto *rv = dynamic_cast<const VarExpr *>(bin->rhs.get())) {
+            if (rv->name == var->name && bin->op == BinaryOp::Mul) {
+              if (sym->constValue)
+                emit("li a0, " + std::to_string(*sym->constValue));
+              else if (!sym->reg.empty())
+                emit("mv a0, " + sym->reg);
+              else if (sym->isGlobal) {
+                emit("la a0, " + sym->label);
+                emit("lw a0, 0(a0)");
+              } else
+                emit("lw a0, " + std::to_string(sym->offset) + "(s0)");
+              emit("mul a0, a0, a0");
+              return;
+            }
+          }
+          if (!exprHasCall(*bin->rhs) && tempDepth_ < 13) {
+            std::string lhsReg = tempRegName(tempDepth_++);
+            int d = tempDepth_ - 1;
+            auto it = loadedAtDepth_.find(d);
+            if (it == loadedAtDepth_.end() || it->second != var->name) {
+              if (sym->constValue)
+                emit("li " + lhsReg + ", " + std::to_string(*sym->constValue));
+              else if (!sym->reg.empty())
+                emit("mv " + lhsReg + ", " + sym->reg);
+              else if (sym->isGlobal) {
+                emit("la " + lhsReg + ", " + sym->label);
+                emit("lw " + lhsReg + ", 0(" + lhsReg + ")");
+              } else
+                emit("lw " + lhsReg + ", " + std::to_string(sym->offset) + "(s0)");
+              loadedAtDepth_[d] = var->name;
+            }
+            emitExpr(*bin->rhs);
+            --tempDepth_;
+            switch (bin->op) {
+            case BinaryOp::Add: emit("add a0, " + lhsReg + ", a0"); break;
+            case BinaryOp::Sub: emit("sub a0, " + lhsReg + ", a0"); break;
+            case BinaryOp::Mul: emit("mul a0, " + lhsReg + ", a0"); break;
+            case BinaryOp::Div: emit("div a0, " + lhsReg + ", a0"); break;
+            case BinaryOp::Mod: emit("rem a0, " + lhsReg + ", a0"); break;
+            case BinaryOp::Lt: emit("slt a0, " + lhsReg + ", a0"); break;
+            case BinaryOp::Gt: emit("slt a0, a0, " + lhsReg); break;
+            case BinaryOp::Le: emit("slt a0, a0, " + lhsReg); emit("xori a0, a0, 1"); break;
+            case BinaryOp::Ge: emit("slt a0, " + lhsReg + ", a0"); emit("xori a0, a0, 1"); break;
+            case BinaryOp::Eq: emit("sub a0, " + lhsReg + ", a0"); emit("seqz a0, a0"); break;
+            case BinaryOp::Ne: emit("sub a0, " + lhsReg + ", a0"); emit("snez a0, a0"); break;
+            default: break;
+            }
+            return;
+          }
+        }
+      }
+      if (auto *inner = dynamic_cast<const BinaryExpr *>(bin->lhs.get())) {
+        if (auto rhsConst = evalConst(*inner->rhs)) {
+          if (inner->op == BinaryOp::Add && *rhsConst >= -2048 && *rhsConst <= 2047) {
+            if (auto *iv = dynamic_cast<const VarExpr *>(inner->lhs.get())) {
+              if (Symbol *is = lookup(iv->name)) {
+                if (!exprHasCall(*bin->rhs) && tempDepth_ < 13) {
+                  std::string lhsReg = tempRegName(tempDepth_++);
+                  if (is->constValue)
+                    emit("li " + lhsReg + ", " + std::to_string(*is->constValue + *rhsConst));
+                  else if (!is->reg.empty())
+                    emit("addi " + lhsReg + ", " + is->reg + ", " + std::to_string(*rhsConst));
+                  else if (is->isGlobal) {
+                    emit("la " + lhsReg + ", " + is->label);
+                    emit("lw " + lhsReg + ", 0(" + lhsReg + ")");
+                    if (*rhsConst != 0) emit("addi " + lhsReg + ", " + lhsReg + ", " + std::to_string(*rhsConst));
+                  } else {
+                    emit("lw " + lhsReg + ", " + std::to_string(is->offset) + "(s0)");
+                    if (*rhsConst != 0) emit("addi " + lhsReg + ", " + lhsReg + ", " + std::to_string(*rhsConst));
+                  }
+                  emitExpr(*bin->rhs);
+                  --tempDepth_;
+                  switch (bin->op) {
+                  case BinaryOp::Add: emit("add a0, " + lhsReg + ", a0"); break;
+                  case BinaryOp::Sub: emit("sub a0, " + lhsReg + ", a0"); break;
+                  case BinaryOp::Mul: emit("mul a0, " + lhsReg + ", a0"); break;
+                  case BinaryOp::Div: emit("div a0, " + lhsReg + ", a0"); break;
+                  case BinaryOp::Mod: emit("rem a0, " + lhsReg + ", a0"); break;
+                  case BinaryOp::Lt: emit("slt a0, " + lhsReg + ", a0"); break;
+                  case BinaryOp::Gt: emit("slt a0, a0, " + lhsReg); break;
+                  case BinaryOp::Le: emit("slt a0, a0, " + lhsReg); emit("xori a0, a0, 1"); break;
+                  case BinaryOp::Ge: emit("slt a0, " + lhsReg + ", a0"); emit("xori a0, a0, 1"); break;
+                  case BinaryOp::Eq: emit("sub a0, " + lhsReg + ", a0"); emit("seqz a0, a0"); break;
+                  case BinaryOp::Ne: emit("sub a0, " + lhsReg + ", a0"); emit("snez a0, a0"); break;
+                  default: break;
+                  }
+                  return;
+                }
+              }
+            }
           }
         }
       }
@@ -479,6 +710,42 @@ void RiscV32CodeGen::emitCondition(const Expr &expr, const std::string &trueLabe
     }
     if (bin->op == BinaryOp::Lt || bin->op == BinaryOp::Gt || bin->op == BinaryOp::Le ||
         bin->op == BinaryOp::Ge || bin->op == BinaryOp::Eq || bin->op == BinaryOp::Ne) {
+      if (optimize_) {
+        if (auto *var = dynamic_cast<const VarExpr *>(bin->lhs.get())) {
+          if (Symbol *sym = lookup(var->name)) {
+            if (!exprHasCall(*bin->rhs) && tempDepth_ < 13) {
+              std::string lhsReg = tempRegName(tempDepth_++);
+              int d = tempDepth_ - 1;
+              auto it = loadedAtDepth_.find(d);
+              if (it == loadedAtDepth_.end() || it->second != var->name) {
+                if (sym->constValue)
+                  emit("li " + lhsReg + ", " + std::to_string(*sym->constValue));
+                else if (!sym->reg.empty())
+                  emit("mv " + lhsReg + ", " + sym->reg);
+                else if (sym->isGlobal) {
+                  emit("la " + lhsReg + ", " + sym->label);
+                  emit("lw " + lhsReg + ", 0(" + lhsReg + ")");
+                } else
+                  emit("lw " + lhsReg + ", " + std::to_string(sym->offset) + "(s0)");
+                loadedAtDepth_[d] = var->name;
+              }
+              emitExpr(*bin->rhs);
+              --tempDepth_;
+              switch (bin->op) {
+              case BinaryOp::Lt: emit("blt " + lhsReg + ", a0, " + trueLabel); break;
+              case BinaryOp::Gt: emit("blt a0, " + lhsReg + ", " + trueLabel); break;
+              case BinaryOp::Le: emit("bge a0, " + lhsReg + ", " + trueLabel); break;
+              case BinaryOp::Ge: emit("bge " + lhsReg + ", a0, " + trueLabel); break;
+              case BinaryOp::Eq: emit("beq " + lhsReg + ", a0, " + trueLabel); break;
+              case BinaryOp::Ne: emit("bne " + lhsReg + ", a0, " + trueLabel); break;
+              default: break;
+              }
+              emit("j " + falseLabel);
+              return;
+            }
+          }
+        }
+      }
       std::string lhsReg = "t0";
       bool useTempReg = optimize_ && !exprHasCall(*bin->rhs) && tempDepth_ < 13;
       if (useTempReg) {
@@ -514,18 +781,25 @@ void RiscV32CodeGen::emitCondition(const Expr &expr, const std::string &trueLabe
 }
 
 void RiscV32CodeGen::emitCall(const CallExpr &call) {
-  for (int i = static_cast<int>(call.args.size()) - 1; i >= 0; --i) {
+  int n = static_cast<int>(call.args.size());
+  if (optimize_ && n == 1 && !exprHasCall(*call.args[0])) {
+    emitExpr(*call.args[0]);
+    emit("call " + call.callee);
+    loadedAtDepth_.clear();
+    return;
+  }
+  for (int i = n - 1; i >= 0; --i) {
     emitExpr(*call.args[static_cast<size_t>(i)]);
     emit("addi sp, sp, -4");
     emit("sw a0, 0(sp)");
   }
-  int n = static_cast<int>(call.args.size());
   int regArgs = std::min(n, 8);
   for (int i = 0; i < regArgs; ++i) {
     emit("lw a" + std::to_string(i) + ", " + std::to_string(i * 4) + "(sp)");
   }
   if (regArgs > 0) emit("addi sp, sp, " + std::to_string(regArgs * 4));
   emit("call " + call.callee);
+  loadedAtDepth_.clear();
   int extra = n - regArgs;
   if (extra > 0) emit("addi sp, sp, " + std::to_string(extra * 4));
 }
