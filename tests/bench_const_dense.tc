@@ -1,0 +1,11 @@
+int main() {
+  const int a = 3 * (4 + 5);
+  const int b = a * 2 + 7;
+  int i = 0;
+  int s = 0;
+  while (i < 120000) {
+    s = s + (a + b) * 1 + 0 - (b % 1);
+    i = i + 1;
+  }
+  return s;
+}

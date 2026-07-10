@@ -1,0 +1,9 @@
+int g = 0;
+void setv(int x) {
+  g = x;
+  return;
+}
+int main() {
+  setv(9);
+  return g;
+}

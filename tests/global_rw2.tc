@@ -1,0 +1,10 @@
+int g = 10;
+int inc(int x) {
+  g = g + x;
+  return g;
+}
+int main() {
+  inc(5);
+  inc(18);
+  return g;
+}

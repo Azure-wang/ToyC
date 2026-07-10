@@ -1,0 +1,11 @@
+int inc(int x) { return x + 1; }
+int mix(int a, int b) { return inc(a) + inc(b); }
+int main() {
+  int i = 0;
+  int s = 0;
+  while (i < 20000) {
+    s = s + mix(i, s % 17);
+    i = i + 1;
+  }
+  return s;
+}

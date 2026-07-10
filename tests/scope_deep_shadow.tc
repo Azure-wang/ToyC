@@ -1,0 +1,12 @@
+int x = 1;
+int main() {
+  int x = 2;
+  {
+    int y = x + 3;
+    {
+      int x = y + 4;
+      return x;
+    }
+  }
+  return x;
+}

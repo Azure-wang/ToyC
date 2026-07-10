@@ -1,0 +1,9 @@
+int add(int a, int b) {
+  return a + b;
+}
+int muladd(int x, int y, int z) {
+  return add(x * y, z);
+}
+int main() {
+  return muladd(3, 4, 5);
+}

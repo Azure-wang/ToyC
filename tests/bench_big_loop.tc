@@ -1,0 +1,9 @@
+int main() {
+  int i = 0;
+  int s = 0;
+  while (i < 200000) {
+    s = s + (i * 3 + 1) % 97;
+    i = i + 1;
+  }
+  return s;
+}

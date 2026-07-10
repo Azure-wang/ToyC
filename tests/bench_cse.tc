@@ -1,0 +1,11 @@
+int main() {
+  int i = 0;
+  int s = 0;
+  while (i < 80000) {
+    int a = i % 97;
+    int b = i % 31;
+    s = s + (a + b) * (a + b) + (a + b);
+    i = i + 1;
+  }
+  return s;
+}

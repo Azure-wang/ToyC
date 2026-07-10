@@ -1,0 +1,6 @@
+const int a = 5;
+int g = a + 1;
+int main() {
+  g = g * 2;
+  return g;
+}

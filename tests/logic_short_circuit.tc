@@ -1,0 +1,14 @@
+int g = 0;
+int setg() {
+  g = 1;
+  return 1;
+}
+int main() {
+  if (0 && setg()) {
+    return 10;
+  }
+  if (1 || setg()) {
+    return g;
+  }
+  return 99;
+}

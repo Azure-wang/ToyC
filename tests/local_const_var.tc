@@ -1,0 +1,5 @@
+int main() {
+  const int a = 7;
+  int b = a * 5;
+  return b;
+}

@@ -1,0 +1,14 @@
+int main() {
+  int i = 0;
+  int s = 0;
+  while (i < 120000) {
+    if (i % 5 == 0) {
+      s = s + i;
+    } else {
+      if (i % 7 == 0) s = s - i;
+      else s = s + 3;
+    }
+    i = i + 1;
+  }
+  return s;
+}

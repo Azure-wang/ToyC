@@ -1,0 +1,5 @@
+const int a = 11;
+const int b = a * 3 + 1;
+int main() {
+  return b + a - 1;
+}
