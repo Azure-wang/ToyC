@@ -1,6 +1,11 @@
 #pragma once
 
 #include "ast.h"
+#include "symbol_table.h"
+
+#include <cstdint>
+#include <string>
+#include <unordered_map>
 
 namespace toyc {
 
@@ -16,6 +21,12 @@ private:
   bool number(const Expr &expr, int32_t &value) const;
   int32_t applyUnary(UnaryOp op, int32_t v) const;
   int32_t applyBinary(BinaryOp op, int32_t a, int32_t b) const;
+  std::string exprKey(const Expr &expr) const;
+  void cseBlock(BlockStmt &block);
+  void cseStmt(std::unique_ptr<Stmt> &stmt);
+
+  ScopedTable<int32_t> constTable_;
+  std::unordered_map<std::string, std::string> cseMap_;
 };
 
 } // namespace toyc

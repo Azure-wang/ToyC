@@ -1,4 +1,4 @@
-#include "codegen_riscv32.h"
+﻿#include "codegen_riscv32.h"
 
 #include "utils.h"
 
@@ -133,6 +133,21 @@ bool RiscV32CodeGen::exprHasCall(const Expr &expr) const {
 }
 
 void RiscV32CodeGen::emitFunction(const Function &fn) {
+  // ── Stack frame layout (grows downward) ──
+  // sp+frameSize              ← s0 (frame pointer)
+  // sp+frameSize-4            ra  (if non-leaf)
+  // sp+frameSize-4/8          saved s0
+  // sp+frameSize-8/12         saved s1 (if optimize_)
+  // sp+frameSize-12/16        saved s2 ...
+  // ...
+  // sp+frameSize-saveArea     first local / spill slot (nextOffset_)
+  // sp+16                     ABI reserved (16 bytes)
+  // sp                        stack pointer
+  //
+  // fixedSaves = 1 (s0) + (leaf ? 0 : 1) (ra) + savedSRegs_
+  // saveArea   = 4 * (fixedSaves + 1)  (saved regs + one guard word)
+  // frameSize  = align16(saveArea + 4*slots + 16)
+
   currentLeaf_ = !functionHasCall(fn);
   savedSRegs_ = optimize_ ? std::min(11, countMutableLocals(fn)) : 0;
   int slots = optimize_ ? std::max(0, countSlots(fn) - savedSRegs_) : countSlots(fn);
@@ -354,11 +369,9 @@ void RiscV32CodeGen::emitExpr(const Expr &expr) {
 
 void RiscV32CodeGen::emitCondition(const Expr &expr, const std::string &trueLabel,
                                    const std::string &falseLabel) {
-  if (optimize_) {
-    if (auto value = evalConst(expr)) {
-      emit("j " + (*value != 0 ? trueLabel : falseLabel));
-      return;
-    }
+  if (auto value = evalConst(expr)) {
+    emit("j " + (*value != 0 ? trueLabel : falseLabel));
+    return;
   }
   if (auto *bin = dynamic_cast<const BinaryExpr *>(&expr)) {
     if (bin->op == BinaryOp::And) {
@@ -375,10 +388,10 @@ void RiscV32CodeGen::emitCondition(const Expr &expr, const std::string &trueLabe
       emitCondition(*bin->rhs, trueLabel, falseLabel);
       return;
     }
-    if (optimize_ && (bin->op == BinaryOp::Lt || bin->op == BinaryOp::Gt || bin->op == BinaryOp::Le ||
-                      bin->op == BinaryOp::Ge || bin->op == BinaryOp::Eq || bin->op == BinaryOp::Ne)) {
+    if (bin->op == BinaryOp::Lt || bin->op == BinaryOp::Gt || bin->op == BinaryOp::Le ||
+        bin->op == BinaryOp::Ge || bin->op == BinaryOp::Eq || bin->op == BinaryOp::Ne) {
       std::string lhsReg = "t0";
-      bool useTempReg = !exprHasCall(*bin->rhs) && tempDepth_ < 7;
+      bool useTempReg = optimize_ && !exprHasCall(*bin->rhs) && tempDepth_ < 7;
       if (useTempReg) {
         lhsReg = "t" + std::to_string(tempDepth_++);
         emitExpr(*bin->lhs);
@@ -479,8 +492,8 @@ int32_t RiscV32CodeGen::applyBinary(BinaryOp op, int32_t a, int32_t b) const {
   case BinaryOp::Add: return wrap32(static_cast<int64_t>(a) + b);
   case BinaryOp::Sub: return wrap32(static_cast<int64_t>(a) - b);
   case BinaryOp::Mul: return wrap32(static_cast<int64_t>(a) * b);
-  case BinaryOp::Div: return b == 0 ? 0 : a / b;
-  case BinaryOp::Mod: return b == 0 ? 0 : a % b;
+  case BinaryOp::Div: return b == 0 ? -1 : a / b;
+  case BinaryOp::Mod: return b == 0 ? a : a % b;
   case BinaryOp::Lt: return a < b;
   case BinaryOp::Gt: return a > b;
   case BinaryOp::Le: return a <= b;

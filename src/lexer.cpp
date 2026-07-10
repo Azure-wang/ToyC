@@ -137,6 +137,8 @@ std::vector<Token> Lexer::tokenize() {
       std::string text;
       if (c == '0') {
         text.push_back(get());
+        if (std::isdigit(static_cast<unsigned char>(peek())))
+          error("leading zeros are not allowed in integer literals", loc);
       } else {
         while (std::isdigit(static_cast<unsigned char>(peek()))) text.push_back(get());
       }

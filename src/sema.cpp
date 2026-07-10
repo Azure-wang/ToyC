@@ -1,4 +1,4 @@
-#include "sema.h"
+﻿#include "sema.h"
 
 #include "utils.h"
 
@@ -202,8 +202,8 @@ int32_t Sema::applyBinary(BinaryOp op, int32_t a, int32_t b) const {
   case BinaryOp::Add: return wrap32(static_cast<int64_t>(a) + b);
   case BinaryOp::Sub: return wrap32(static_cast<int64_t>(a) - b);
   case BinaryOp::Mul: return wrap32(static_cast<int64_t>(a) * b);
-  case BinaryOp::Div: return b == 0 ? 0 : a / b;
-  case BinaryOp::Mod: return b == 0 ? 0 : a % b;
+  case BinaryOp::Div: return b == 0 ? -1 : a / b;
+  case BinaryOp::Mod: return b == 0 ? a : a % b;
   case BinaryOp::Lt: return a < b;
   case BinaryOp::Gt: return a > b;
   case BinaryOp::Le: return a <= b;

@@ -1,7 +1,6 @@
 #include "ir.h"
 
 namespace toyc {
-// The project uses a compact structured IR boundary: AST is lowered into
-// labeled control-flow blocks directly in the RISC-V backend. These data
-// structures document the TAC-like shape used by the optimizer/report.
+// IR data structures are defined in ir.h. The backend currently lowers AST
+// to RISC-V assembly in a single pass; see codegen_riscv32.cpp.
 }
