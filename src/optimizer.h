@@ -16,6 +16,7 @@ public:
 
 private:
   bool foldExpr(std::unique_ptr<Expr> &expr);
+  bool foldExpr(std::unique_ptr<Expr> &expr, int depth);
   void optimizeStmt(std::unique_ptr<Stmt> &stmt);
   void optimizeBlock(BlockStmt &block);
   bool isTerminator(const Stmt &stmt) const;

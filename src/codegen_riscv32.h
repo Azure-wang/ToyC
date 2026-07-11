@@ -62,6 +62,7 @@ private:
   std::optional<int32_t> evalConst(const Expr &expr);
   int32_t applyUnary(UnaryOp op, int32_t v) const;
   int32_t applyBinary(BinaryOp op, int32_t a, int32_t b) const;
+  std::string peepholeOptimize(const std::string &code);
 
   const std::unordered_map<std::string, FunctionSig> &functions_;
   bool optimize_ = false;
@@ -75,8 +76,13 @@ private:
   int savedSRegs_ = 0;
   int nextVarReg_ = 0;
   int tempDepth_ = 0;
+  int spillBase_ = 0;
+  int spillDepth_ = 0;
   bool currentLeaf_ = false;
   std::string currentReturnLabel_;
+  std::string currentFnName_;
+  std::string tailBodyLabel_;
+  std::vector<std::string> currentParamNames_;
 };
 
 } // namespace toyc

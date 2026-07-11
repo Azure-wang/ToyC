@@ -114,6 +114,11 @@ bool Optimizer::isTerminator(const Stmt &stmt) const {
 }
 
 bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr) {
+  return foldExpr(expr, 0);
+}
+
+bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr, int depth) {
+  if (depth > 400) return false;
   if (auto *var = dynamic_cast<VarExpr *>(expr.get())) {
     int32_t v = 0;
     if (number(*var, v)) {
@@ -123,13 +128,13 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr) {
     return false;
   }
   if (auto *call = dynamic_cast<CallExpr *>(expr.get())) {
-    for (auto &arg : call->args) foldExpr(arg);
+    for (auto &arg : call->args) foldExpr(arg, depth + 1);
     return false;
   }
   if (dynamic_cast<NumberExpr *>(expr.get())) return false;
 
   if (auto *un = dynamic_cast<UnaryExpr *>(expr.get())) {
-    foldExpr(un->operand);
+    foldExpr(un->operand, depth + 1);
     int32_t v = 0;
     if (number(*un->operand, v)) {
       expr = std::make_unique<NumberExpr>(un->loc, applyUnary(un->op, v));
@@ -150,14 +155,14 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr) {
     return false;
   }
   if (auto *bin = dynamic_cast<BinaryExpr *>(expr.get())) {
-    foldExpr(bin->lhs);
-    foldExpr(bin->rhs);
+    foldExpr(bin->lhs, depth + 1);
+    foldExpr(bin->rhs, depth + 1);
     if (bin->op == BinaryOp::Add) {
       if (auto *rhsNeg = dynamic_cast<UnaryExpr *>(bin->rhs.get())) {
         if (rhsNeg->op == UnaryOp::Minus) {
           bin->op = BinaryOp::Sub;
           bin->rhs = std::move(rhsNeg->operand);
-          foldExpr(expr);
+          foldExpr(expr, depth + 1);
           return true;
         }
       }
@@ -166,7 +171,7 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr) {
           bin->op = BinaryOp::Sub;
           bin->lhs = std::move(bin->rhs);
           bin->rhs = std::move(lhsNeg->operand);
-          foldExpr(expr);
+          foldExpr(expr, depth + 1);
           return true;
         }
       }
@@ -189,7 +194,7 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr) {
       auto neg = std::make_unique<UnaryExpr>(bin->loc, UnaryOp::Minus, std::move(x));
       expr = std::make_unique<BinaryExpr>(bin->loc, BinaryOp::Add,
           std::move(neg), std::move(bin->lhs));
-      foldExpr(expr);
+      foldExpr(expr, depth + 1);
       return true;
     }
     if (bin->op == BinaryOp::Add && hasB && b == 0) expr = std::move(bin->lhs);
@@ -609,9 +614,11 @@ bool Optimizer::exprRefsModified(const Expr &expr,
 bool Optimizer::isInvariant(const Stmt &stmt,
     const std::unordered_set<std::string> &mustSet) const {
   if (auto *decl = dynamic_cast<const DeclStmt *>(&stmt))
-    return !exprRefsModified(*decl->decl.init, mustSet);
+    return !exprRefsModified(*decl->decl.init, mustSet)
+        && mustSet.count(decl->decl.name) == 0;
   if (auto *assign = dynamic_cast<const AssignStmt *>(&stmt))
-    return !exprRefsModified(*assign->value, mustSet);
+    return !exprRefsModified(*assign->value, mustSet)
+        && mustSet.count(assign->name) == 0;
   return false;
 }
 
@@ -801,11 +808,15 @@ static void collectLocalNames(const Stmt &stmt,
   }
 }
 
+static const int MAX_INLINE_DEPTH = 8;
+
 std::unique_ptr<Expr> Optimizer::inlineInExpr(std::unique_ptr<Expr> expr,
     const std::unordered_map<std::string, const Function *> &funcMap,
     const std::string &currentFn,
     std::vector<std::unique_ptr<Stmt>> &preStmts,
     int &counter, SourceLoc loc) {
+  // Guard against excessive inlining depth
+  if (counter > 200) return expr;
   // Bottom-up: recurse first
   if (auto *un = dynamic_cast<UnaryExpr *>(expr.get())) {
     un->operand = inlineInExpr(std::move(un->operand),
@@ -910,13 +921,28 @@ void Optimizer::inlineInBlock(BlockStmt &block,
 
 void Optimizer::inlineCalls(Program &program) {
   std::unordered_map<std::string, const Function *> funcMap;
+  std::unordered_set<std::string> noInline;
   for (const auto &item : program.items) {
     if (auto *tf = dynamic_cast<TopFunction *>(item.get()))
       funcMap[tf->func.name] = &tf->func;
   }
+  // Detect mutual/simple recursion and mark for no inlining
+  for (auto &kv : funcMap) {
+    for (auto &kv2 : funcMap) {
+      if (kv.first == kv2.first) continue;
+      if (callsSelf(*kv.second->body, kv2.first) &&
+          callsSelf(*kv2.second->body, kv.first)) {
+        noInline.insert(kv.first);
+        noInline.insert(kv2.first);
+      }
+    }
+  }
+  // Remove non-inlinable functions from the map
+  for (const auto &name : noInline) funcMap.erase(name);
   bool changed = true;
   int counter = 0;
-  while (changed) {
+  int maxIter = 5;
+  while (changed && maxIter-- > 0) {
     changed = false;
     for (auto &item : program.items) {
       if (auto *tf = dynamic_cast<TopFunction *>(item.get())) {

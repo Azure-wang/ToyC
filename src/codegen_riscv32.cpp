@@ -3,6 +3,7 @@
 #include "utils.h"
 
 #include <algorithm>
+#include <sstream>
 
 namespace toyc {
 
@@ -49,7 +50,36 @@ std::string RiscV32CodeGen::generate(const Program &program) {
     if (auto *fn = dynamic_cast<TopFunction *>(item.get())) emitFunction(fn->func);
   }
   symbols_.pop();
-  return data_.str() + text_.str();
+  return data_.str() + peepholeOptimize(text_.str());
+}
+
+std::string RiscV32CodeGen::peepholeOptimize(const std::string &code) {
+  std::istringstream in(code);
+  std::ostringstream out;
+  std::string line;
+  std::string prevLine;
+  while (std::getline(in, line)) {
+    if (!prevLine.empty()) {
+      auto trim = [](std::string s) {
+        while (!s.empty() && (s.back() == '\r' || s.back() == ' ')) s.pop_back();
+        return s;
+      };
+      std::string p = trim(prevLine);
+      std::string l = trim(line);
+      // Remove "j LABEL" followed immediately by "LABEL:"
+      if (p.size() > 4 && p.substr(0, 4) == "  j ") {
+        std::string target = p.substr(4);
+        if (l == target + ":") {
+          prevLine = line;  // keep the label, drop the jump
+          continue;
+        }
+      }
+    }
+    if (!prevLine.empty()) out << prevLine << "\n";
+    prevLine = line;
+  }
+  if (!prevLine.empty()) out << prevLine << "\n";
+  return out.str();
 }
 
 void RiscV32CodeGen::emitData(const Program &program) {
@@ -155,15 +185,25 @@ void RiscV32CodeGen::emitFunction(const Function &fn) {
   // saveArea   = 4 * (fixedSaves + 1)  (saved regs + one guard word)
   // frameSize  = align16(saveArea + 4*slots + 16)
 
+  currentFnName_ = fn.name;
   currentLeaf_ = !functionHasCall(fn);
   savedSRegs_ = optimize_ ? std::min(11, countMutableLocals(fn)) : 0;
+  int spillSlots = 12;
   int slots = optimize_ ? std::max(0, countSlots(fn) - savedSRegs_) : countSlots(fn);
+  slots += spillSlots;
   int fixedSaves = 1 + (currentLeaf_ ? 0 : 1) + savedSRegs_;
   frameSize_ = align16(4 * (slots + fixedSaves) + 16);
   nextOffset_ = -4 * (fixedSaves + 1);
   nextVarReg_ = 0;
   tempDepth_ = 0;
+  spillDepth_ = 0;
   currentReturnLabel_ = label("ret_" + sanitizeLabel(fn.name));
+  tailBodyLabel_ = fn.name + "_body";
+  spillBase_ = nextOffset_;
+  for (int i = 0; i < spillSlots; ++i) nextOffset_ -= 4;
+  currentParamNames_.clear();
+  for (const auto &p : fn.params)
+    currentParamNames_.push_back(p.name);
 
   text_ << "\n.globl " << fn.name << "\n";
   text_ << fn.name << ":\n";
@@ -195,6 +235,8 @@ void RiscV32CodeGen::emitFunction(const Function &fn) {
       else emit("sw t0, " + std::to_string(sym.offset) + "(s0)");
     }
   }
+  tailBodyLabel_ = label("body_" + sanitizeLabel(fn.name));
+  text_ << tailBodyLabel_ << ":\n";
   emitBlock(*fn.body, true);
   if (fn.returnType == Type::Void) emit("li a0, 0");
   text_ << currentReturnLabel_ << ":\n";
@@ -260,12 +302,31 @@ void RiscV32CodeGen::emitStmt(const Stmt &stmt) {
     if (ret->value) {
       if (optimize_ && dynamic_cast<const CallExpr *>(ret->value.get())) {
         const auto &call = dynamic_cast<const CallExpr &>(*ret->value);
-        for (int i = static_cast<int>(call.args.size()) - 1; i >= 0; --i) {
+        int n = static_cast<int>(call.args.size());
+        if (call.callee == currentFnName_) {
+          // Tail recursion: evaluate args, update params in place, jump to body
+          for (int i = n - 1; i >= 0; --i) {
+            emitExpr(*call.args[static_cast<size_t>(i)]);
+            emit("addi sp, sp, -4");
+            emit("sw a0, 0(sp)");
+          }
+          for (size_t i = 0; i < currentParamNames_.size() && static_cast<int>(i) < n; ++i) {
+            Symbol *sym = lookup(currentParamNames_[i]);
+            if (!sym) continue;
+            int argOff = static_cast<int>(n - 1 - i) * 4;
+            emit("lw a0, " + std::to_string(argOff) + "(sp)");
+            storeTo(*sym, call.loc);
+          }
+          if (n > 0) emit("addi sp, sp, " + std::to_string(n * 4));
+          emit("j " + tailBodyLabel_);
+          return;
+        }
+        // Non-recursive tail call
+        for (int i = n - 1; i >= 0; --i) {
           emitExpr(*call.args[static_cast<size_t>(i)]);
           emit("addi sp, sp, -4");
           emit("sw a0, 0(sp)");
         }
-        int n = static_cast<int>(call.args.size());
         int regArgs = std::min(n, 8);
         for (int i = 0; i < regArgs; ++i)
           emit("lw a" + std::to_string(i) + ", " + std::to_string(i * 4) + "(sp)");
@@ -427,11 +488,12 @@ void RiscV32CodeGen::emitExpr(const Expr &expr) {
       --tempDepth_;
     } else {
       emitExpr(*bin->lhs);
-      emit("addi sp, sp, -4");
-      emit("sw a0, 0(sp)");
+      int spillOff = spillBase_ - spillDepth_ * 4;
+      ++spillDepth_;
+      emit("sw a0, " + std::to_string(spillOff) + "(s0)");
       emitExpr(*bin->rhs);
-      emit("lw t0, 0(sp)");
-      emit("addi sp, sp, 4");
+      --spillDepth_;
+      emit("lw t0, " + std::to_string(spillOff) + "(s0)");
     }
     switch (bin->op) {
     case BinaryOp::Add: emit("add a0, " + lhsReg + ", a0"); break;
@@ -489,11 +551,12 @@ void RiscV32CodeGen::emitCondition(const Expr &expr, const std::string &trueLabe
         --tempDepth_;
       } else {
         emitExpr(*bin->lhs);
-        emit("addi sp, sp, -4");
-        emit("sw a0, 0(sp)");
+        int spillOff = spillBase_ - spillDepth_ * 4;
+        ++spillDepth_;
+        emit("sw a0, " + std::to_string(spillOff) + "(s0)");
         emitExpr(*bin->rhs);
-        emit("lw t0, 0(sp)");
-        emit("addi sp, sp, 4");
+        --spillDepth_;
+        emit("lw t0, " + std::to_string(spillOff) + "(s0)");
       }
       switch (bin->op) {
       case BinaryOp::Lt: emit("blt " + lhsReg + ", a0, " + trueLabel); break;
