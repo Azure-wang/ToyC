@@ -319,6 +319,7 @@ void RiscV32CodeGen::emitStmt(const Stmt &stmt) {
     std::string bodyL = label("while_body");
     std::string endL = label("while_end");
     loops_.push_back(LoopLabels{condL, endL});
+    emit("j " + condL);
     text_ << condL << ":\n";
     emitCondition(*wh->cond, bodyL, endL);
     text_ << bodyL << ":\n";
