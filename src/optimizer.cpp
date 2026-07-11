@@ -41,6 +41,7 @@ void Optimizer::optimize(Program &program) {
   }
   for (auto &item : program.items) {
     if (auto *fn = dynamic_cast<TopFunction *>(item.get())) {
+      cseMap_.clear();
       optimizeBlock(*fn->func.body);
     }
   }
@@ -48,6 +49,7 @@ void Optimizer::optimize(Program &program) {
   removeDeadFunctions(program);
   for (auto &item : program.items) {
     if (auto *fn = dynamic_cast<TopFunction *>(item.get())) {
+      cseMap_.clear();
       optimizeBlock(*fn->func.body);
     }
   }
@@ -378,17 +380,22 @@ static void invalidateVar(std::unordered_map<std::string, std::string> &m, const
 }
 
 void Optimizer::cseBlock(BlockStmt &block) {
+  auto outerMap = cseMap_;
+  for (auto &stmt : block.stmts) cseStmt(stmt);
   std::unordered_set<std::string> localsDeclared;
   for (const auto &stmt : block.stmts) {
     if (auto *decl = dynamic_cast<const DeclStmt *>(stmt.get()))
       if (!decl->decl.isConst) localsDeclared.insert(decl->decl.name);
   }
-  for (auto &stmt : block.stmts) cseStmt(stmt);
   for (auto it = cseMap_.begin(); it != cseMap_.end(); ) {
     if (localsDeclared.count(it->second))
       it = cseMap_.erase(it);
     else
       ++it;
+  }
+  for (const auto &kv : outerMap) {
+    if (!cseMap_.count(kv.first))
+      cseMap_[kv.first] = kv.second;
   }
 }
 
