@@ -30,12 +30,6 @@ private:
   bool hoistInStmt(std::unique_ptr<Stmt> &stmt, int &cseCounter,
       std::vector<std::unique_ptr<Stmt>> &preStmts);
   void countSubexprs(const Expr &expr, std::unordered_map<std::string, int> &counts) const;
-  void eliminateSingleUseTemps(BlockStmt &block);
-  void copyPropagate(BlockStmt &block);
-  void substituteCopies(std::unique_ptr<Stmt> &stmt,
-      const std::unordered_map<std::string, std::unique_ptr<Expr>> &copyMap);
-  void substituteInExpr(std::unique_ptr<Expr> &expr,
-      const std::unordered_map<std::string, std::unique_ptr<Expr>> &copyMap);
   void eliminateDeadStores(BlockStmt &block);
   void hoistLoopInvariants(BlockStmt &block);
   void computeModifiedVars(const Stmt &stmt, std::unordered_set<std::string> &vars) const;
