@@ -24,9 +24,70 @@ void RiscV32CodeGen::emit(const std::string &line) { text_ << "  " << line << "\
 
 bool RiscV32CodeGen::hasVarRegs() const { return optimize_; }
 
-std::string RiscV32CodeGen::allocVarReg() {
-  if (!hasVarRegs() || nextVarReg_ >= savedSRegs_) return "";
+std::string RiscV32CodeGen::allocVarReg(const std::string &name) {
+  if (!hasVarRegs()) return "";
+  if (!name.empty()) {
+    auto it = preAllocRegs_.find(name);
+    if (it != preAllocRegs_.end()) return it->second;
+    return "";
+  }
+  if (nextVarReg_ >= savedSRegs_) return "";
   return "s" + std::to_string(1 + nextVarReg_++);
+}
+
+int RiscV32CodeGen::countExprRefs(const Expr &expr, const std::string &name) const {
+  if (auto *var = dynamic_cast<const VarExpr *>(&expr))
+    return var->name == name ? 1 : 0;
+  if (auto *un = dynamic_cast<const UnaryExpr *>(&expr))
+    return countExprRefs(*un->operand, name);
+  if (auto *bin = dynamic_cast<const BinaryExpr *>(&expr))
+    return countExprRefs(*bin->lhs, name) + countExprRefs(*bin->rhs, name);
+  if (auto *call = dynamic_cast<const CallExpr *>(&expr)) {
+    int n = 0;
+    for (const auto &arg : call->args) n += countExprRefs(*arg, name);
+    return n;
+  }
+  return 0;
+}
+
+int RiscV32CodeGen::countStmtRefs(const Stmt &stmt, const std::string &name, int loopDepth) const {
+  int w = (loopDepth > 0) ? 10 : 1;
+  if (auto *block = dynamic_cast<const BlockStmt *>(&stmt)) {
+    int n = 0;
+    for (const auto &s : block->stmts) n += countStmtRefs(*s, name, loopDepth);
+    return n;
+  }
+  if (auto *decl = dynamic_cast<const DeclStmt *>(&stmt)) {
+    if (decl->decl.name == name) return 0;
+    return countExprRefs(*decl->decl.init, name) * w;
+  }
+  if (auto *assign = dynamic_cast<const AssignStmt *>(&stmt))
+    return countExprRefs(*assign->value, name) * w;
+  if (auto *es = dynamic_cast<const ExprStmt *>(&stmt))
+    return countExprRefs(*es->expr, name) * w;
+  if (auto *ifs = dynamic_cast<const IfStmt *>(&stmt))
+    return (countExprRefs(*ifs->cond, name) +
+            countStmtRefs(*ifs->thenBranch, name, loopDepth) +
+            (ifs->elseBranch ? countStmtRefs(*ifs->elseBranch, name, loopDepth) : 0)) * w;
+  if (auto *wh = dynamic_cast<const WhileStmt *>(&stmt))
+    return (countExprRefs(*wh->cond, name) +
+            countStmtRefs(*wh->body, name, loopDepth + 1)) * w;
+  if (auto *ret = dynamic_cast<const ReturnStmt *>(&stmt))
+    return (ret->value ? countExprRefs(*ret->value, name) : 0) * w;
+  return 0;
+}
+
+void RiscV32CodeGen::collectVarNames(const Stmt &stmt, std::vector<std::string> &names) const {
+  if (auto *block = dynamic_cast<const BlockStmt *>(&stmt)) {
+    for (const auto &s : block->stmts) collectVarNames(*s, names);
+  } else if (auto *decl = dynamic_cast<const DeclStmt *>(&stmt)) {
+    if (!decl->decl.isConst) names.push_back(decl->decl.name);
+  } else if (auto *ifs = dynamic_cast<const IfStmt *>(&stmt)) {
+    collectVarNames(*ifs->thenBranch, names);
+    if (ifs->elseBranch) collectVarNames(*ifs->elseBranch, names);
+  } else if (auto *wh = dynamic_cast<const WhileStmt *>(&stmt)) {
+    collectVarNames(*wh->body, names);
+  }
 }
 
 std::string RiscV32CodeGen::tempRegName(int depth) const {
@@ -49,7 +110,9 @@ std::string RiscV32CodeGen::generate(const Program &program) {
     if (auto *fn = dynamic_cast<TopFunction *>(item.get())) emitFunction(fn->func);
   }
   symbols_.pop();
-  return data_.str() + text_.str();
+  std::string result = data_.str() + text_.str();
+  if (optimize_) result = peepholePass(result);
+  return result;
 }
 
 void RiscV32CodeGen::emitData(const Program &program) {
@@ -140,22 +203,25 @@ bool RiscV32CodeGen::exprHasCall(const Expr &expr) const {
 }
 
 void RiscV32CodeGen::emitFunction(const Function &fn) {
-  // ── Stack frame layout (grows downward) ──
-  // sp+frameSize              ← s0 (frame pointer)
-  // sp+frameSize-4            ra  (if non-leaf)
-  // sp+frameSize-4/8          saved s0
-  // sp+frameSize-8/12         saved s1 (if optimize_)
-  // sp+frameSize-12/16        saved s2 ...
-  // ...
-  // sp+frameSize-saveArea     first local / spill slot (nextOffset_)
-  // sp+16                     ABI reserved (16 bytes)
-  // sp                        stack pointer
-  //
-  // fixedSaves = 1 (s0) + (leaf ? 0 : 1) (ra) + savedSRegs_
-  // saveArea   = 4 * (fixedSaves + 1)  (saved regs + one guard word)
-  // frameSize  = align16(saveArea + 4*slots + 16)
-
   currentLeaf_ = !functionHasCall(fn);
+  preAllocRegs_.clear();
+
+  // Pre-compute priority-based register allocation
+  if (optimize_) {
+    std::vector<std::string> allVars;
+    for (const auto &p : fn.params) allVars.push_back(p.name);
+    collectVarNames(*fn.body, allVars);
+    std::unordered_map<std::string, int> weights;
+    for (const auto &name : allVars)
+      weights[name] = countStmtRefs(*fn.body, name, 0);
+    std::sort(allVars.begin(), allVars.end(), [&](const std::string &a, const std::string &b) {
+      return weights[a] > weights[b];
+    });
+    int numRegs = std::min(11, static_cast<int>(allVars.size()));
+    for (int i = 0; i < numRegs; ++i)
+      preAllocRegs_[allVars[static_cast<size_t>(i)]] = "s" + std::to_string(1 + i);
+  }
+
   savedSRegs_ = optimize_ ? std::min(11, countMutableLocals(fn)) : 0;
   int slots = optimize_ ? std::max(0, countSlots(fn) - savedSRegs_) : countSlots(fn);
   int fixedSaves = 1 + (currentLeaf_ ? 0 : 1) + savedSRegs_;
@@ -179,7 +245,7 @@ void RiscV32CodeGen::emitFunction(const Function &fn) {
   symbols_.push();
   for (size_t i = 0; i < fn.params.size(); ++i) {
     Symbol sym;
-    sym.reg = allocVarReg();
+    sym.reg = allocVarReg(fn.params[i].name);
     if (sym.reg.empty()) {
       sym.offset = nextOffset_;
       nextOffset_ -= 4;
@@ -225,28 +291,6 @@ void RiscV32CodeGen::emitStmt(const Stmt &stmt) {
     if (!sym) error(assign->loc, "unknown variable '" + assign->name + "'");
     if (sym->isConst) error(assign->loc, "cannot assign const");
     if (optimize_ && !sym->reg.empty()) {
-      if (auto *var = dynamic_cast<const VarExpr *>(assign->value.get())) {
-        Symbol *rhs = lookup(var->name);
-        if (rhs) {
-          if (rhs->constValue) emit("li " + sym->reg + ", " + std::to_string(*rhs->constValue));
-          else if (!rhs->reg.empty()) emit("mv " + sym->reg + ", " + rhs->reg);
-          else if (rhs->isGlobal) { emit("la t0, " + rhs->label); emit("lw " + sym->reg + ", 0(t0)"); }
-          else emit("lw " + sym->reg + ", " + std::to_string(rhs->offset) + "(s0)");
-          return;
-        }
-      }
-      if (auto c = evalConst(*assign->value)) {
-        emit("li " + sym->reg + ", " + std::to_string(*c));
-        return;
-      }
-      if (auto *un = dynamic_cast<UnaryExpr *>(assign->value.get())) {
-        if (auto *uv = dynamic_cast<VarExpr *>(un->operand.get())) {
-          if (uv->name == assign->name) {
-            if (un->op == UnaryOp::Minus) { emit("neg " + sym->reg + ", " + sym->reg); return; }
-            if (un->op == UnaryOp::Not) { emit("seqz " + sym->reg + ", " + sym->reg); return; }
-          }
-        }
-      }
       if (auto *bin = dynamic_cast<BinaryExpr *>(assign->value.get())) {
         if (auto *lv = dynamic_cast<VarExpr *>(bin->lhs.get())) {
           if (lv->name == assign->name) {
@@ -320,60 +364,6 @@ void RiscV32CodeGen::emitStmt(const Stmt &stmt) {
         }
       }
     }
-    if (optimize_ && !sym->reg.empty()) {
-      if (auto *bin = dynamic_cast<BinaryExpr *>(assign->value.get())) {
-        if (auto *lv = dynamic_cast<const VarExpr *>(bin->lhs.get())) {
-          Symbol *ls = lookup(lv->name);
-          if (ls && !ls->reg.empty() && !exprHasCall(*assign->value)) {
-            if (auto *rv = dynamic_cast<const VarExpr *>(bin->rhs.get())) {
-              Symbol *rs = lookup(rv->name);
-              if (rs && !rs->reg.empty()) {
-                switch (bin->op) {
-                case BinaryOp::Add: emit("add " + sym->reg + ", " + ls->reg + ", " + rs->reg); return;
-                case BinaryOp::Sub: emit("sub " + sym->reg + ", " + ls->reg + ", " + rs->reg); return;
-                case BinaryOp::Mul: emit("mul " + sym->reg + ", " + ls->reg + ", " + rs->reg); return;
-                case BinaryOp::Div: emit("div " + sym->reg + ", " + ls->reg + ", " + rs->reg); return;
-                case BinaryOp::Mod: emit("rem " + sym->reg + ", " + ls->reg + ", " + rs->reg); return;
-                case BinaryOp::Lt: emit("slt " + sym->reg + ", " + ls->reg + ", " + rs->reg); return;
-                case BinaryOp::Gt: emit("slt " + sym->reg + ", " + rs->reg + ", " + ls->reg); return;
-                case BinaryOp::Le:
-                  emit("slt " + sym->reg + ", " + rs->reg + ", " + ls->reg);
-                  emit("xori " + sym->reg + ", " + sym->reg + ", 1");
-                  return;
-                case BinaryOp::Ge:
-                  emit("slt " + sym->reg + ", " + ls->reg + ", " + rs->reg);
-                  emit("xori " + sym->reg + ", " + sym->reg + ", 1");
-                  return;
-                case BinaryOp::Eq:
-                  emit("sub " + sym->reg + ", " + ls->reg + ", " + rs->reg);
-                  emit("seqz " + sym->reg + ", " + sym->reg);
-                  return;
-                case BinaryOp::Ne:
-                  emit("sub " + sym->reg + ", " + ls->reg + ", " + rs->reg);
-                  emit("snez " + sym->reg + ", " + sym->reg);
-                  return;
-                default: break;
-                }
-              }
-            }
-            if (auto c = evalConst(*bin->rhs)) {
-              if (bin->op == BinaryOp::Add && *c >= -2048 && *c <= 2047) {
-                emit("addi " + sym->reg + ", " + ls->reg + ", " + std::to_string(*c));
-                return;
-              }
-              if (bin->op == BinaryOp::Sub && *c >= -2047 && *c <= 2048) {
-                emit("addi " + sym->reg + ", " + ls->reg + ", " + std::to_string(-*c));
-                return;
-              }
-              if (bin->op == BinaryOp::Lt && *c >= -2048 && *c <= 2047) {
-                emit("slti " + sym->reg + ", " + ls->reg + ", " + std::to_string(*c));
-                return;
-              }
-            }
-          }
-        }
-      }
-    }
     emitExpr(*assign->value);
     storeTo(*sym, assign->loc);
   } else if (auto *ifs = dynamic_cast<const IfStmt *>(&stmt)) {
@@ -383,10 +373,11 @@ void RiscV32CodeGen::emitStmt(const Stmt &stmt) {
     emitCondition(*ifs->cond, thenL, ifs->elseBranch ? elseL : endL);
     text_ << thenL << ":\n";
     emitStmt(*ifs->thenBranch);
+    emit("j " + endL);
     if (ifs->elseBranch) {
-      emit("j " + endL);
       text_ << elseL << ":\n";
       emitStmt(*ifs->elseBranch);
+      emit("j " + endL);
     }
     text_ << endL << ":\n";
   } else if (auto *wh = dynamic_cast<const WhileStmt *>(&stmt)) {
@@ -394,6 +385,7 @@ void RiscV32CodeGen::emitStmt(const Stmt &stmt) {
     std::string bodyL = label("while_body");
     std::string endL = label("while_end");
     loops_.push_back(LoopLabels{condL, endL});
+    emit("j " + condL);
     text_ << condL << ":\n";
     emitCondition(*wh->cond, bodyL, endL);
     text_ << bodyL << ":\n";
@@ -449,7 +441,7 @@ void RiscV32CodeGen::emitDecl(const Decl &decl) {
     symbols_.declare(decl.name, sym);
     return;
   }
-  sym.reg = allocVarReg();
+  sym.reg = allocVarReg(decl.name);
   if (sym.reg.empty()) {
     sym.offset = nextOffset_;
     nextOffset_ -= 4;
@@ -492,22 +484,6 @@ void RiscV32CodeGen::emitExpr(const Expr &expr) {
     return;
   }
   if (auto *un = dynamic_cast<const UnaryExpr *>(&expr)) {
-    if (optimize_ && (un->op == UnaryOp::Minus || un->op == UnaryOp::Not)) {
-      if (auto *var = dynamic_cast<const VarExpr *>(un->operand.get())) {
-        if (Symbol *sym = lookup(var->name)) {
-          if (!sym->reg.empty()) {
-            if (un->op == UnaryOp::Minus) emit("neg a0, " + sym->reg);
-            else emit("seqz a0, " + sym->reg);
-            return;
-          }
-          if (sym->constValue) {
-            int32_t v = un->op == UnaryOp::Minus ? -(*sym->constValue) : (*sym->constValue == 0 ? 1 : 0);
-            emit("li a0, " + std::to_string(v));
-            return;
-          }
-        }
-      }
-    }
     emitExpr(*un->operand);
     if (un->op == UnaryOp::Minus) emit("neg a0, a0");
     else if (un->op == UnaryOp::Not) emit("seqz a0, a0");
@@ -958,6 +934,45 @@ int32_t RiscV32CodeGen::applyBinary(BinaryOp op, int32_t a, int32_t b) const {
   case BinaryOp::Or: return (a != 0) || (b != 0);
   }
   return 0;
+}
+
+std::string RiscV32CodeGen::peepholePass(const std::string &input) const {
+  std::vector<std::string> lines;
+  std::istringstream in(input);
+  std::string line;
+  while (std::getline(in, line)) lines.push_back(line);
+
+  // Pass 1: remove redundant jumps to the next label
+  std::vector<bool> keep(lines.size(), true);
+  for (size_t i = 0; i + 1 < lines.size(); ++i) {
+    const std::string &cur = lines[i];
+    const std::string &nxt = lines[i + 1];
+    if (cur.compare(0, 4, "  j ") == 0 && cur.size() > 4) {
+      std::string target = cur.substr(4);
+      if (nxt == target + ":")
+        keep[i] = false;
+    }
+  }
+
+  // Pass 2: mv rd, rd → nop (remove)
+  for (size_t i = 0; i < lines.size(); ++i) {
+    if (!keep[i]) continue;
+    const std::string &l = lines[i];
+    if (l.compare(0, 5, "  mv ") == 0) {
+      size_t comma = l.find(", ", 5);
+      if (comma != std::string::npos) {
+        std::string rd = l.substr(5, comma - 5);
+        std::string rs = l.substr(comma + 2);
+        if (rd == rs) keep[i] = false;
+      }
+    }
+  }
+
+  std::ostringstream out;
+  for (size_t i = 0; i < lines.size(); ++i) {
+    if (keep[i]) out << lines[i] << "\n";
+  }
+  return out.str();
 }
 
 } // namespace toyc

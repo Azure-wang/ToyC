@@ -378,8 +378,18 @@ static void invalidateVar(std::unordered_map<std::string, std::string> &m, const
 }
 
 void Optimizer::cseBlock(BlockStmt &block) {
-  cseMap_.clear();
+  std::unordered_set<std::string> localsDeclared;
+  for (const auto &stmt : block.stmts) {
+    if (auto *decl = dynamic_cast<const DeclStmt *>(stmt.get()))
+      if (!decl->decl.isConst) localsDeclared.insert(decl->decl.name);
+  }
   for (auto &stmt : block.stmts) cseStmt(stmt);
+  for (auto it = cseMap_.begin(); it != cseMap_.end(); ) {
+    if (localsDeclared.count(it->second))
+      it = cseMap_.erase(it);
+    else
+      ++it;
+  }
 }
 
 void Optimizer::cseStmt(std::unique_ptr<Stmt> &stmt) {
@@ -388,12 +398,32 @@ void Optimizer::cseStmt(std::unique_ptr<Stmt> &stmt) {
     return;
   }
   if (auto *ifs = dynamic_cast<IfStmt *>(stmt.get())) {
+    std::string key = exprKey(*ifs->cond);
+    if (!key.empty() && !dynamic_cast<NumberExpr *>(ifs->cond.get()) && cseMap_.count(key))
+      ifs->cond = std::make_unique<VarExpr>(ifs->cond->loc, cseMap_[key]);
     cseStmt(ifs->thenBranch);
     if (ifs->elseBranch) cseStmt(ifs->elseBranch);
     return;
   }
   if (auto *wh = dynamic_cast<WhileStmt *>(stmt.get())) {
+    std::string key = exprKey(*wh->cond);
+    if (!key.empty() && !dynamic_cast<NumberExpr *>(wh->cond.get()) && cseMap_.count(key))
+      wh->cond = std::make_unique<VarExpr>(wh->cond->loc, cseMap_[key]);
     cseStmt(wh->body);
+    return;
+  }
+  if (auto *ret = dynamic_cast<ReturnStmt *>(stmt.get())) {
+    if (ret->value) {
+      std::string key = exprKey(*ret->value);
+      if (!key.empty() && !dynamic_cast<NumberExpr *>(ret->value.get()) && cseMap_.count(key))
+        ret->value = std::make_unique<VarExpr>(ret->value->loc, cseMap_[key]);
+    }
+    return;
+  }
+  if (auto *es = dynamic_cast<ExprStmt *>(stmt.get())) {
+    std::string key = exprKey(*es->expr);
+    if (!key.empty() && !dynamic_cast<NumberExpr *>(es->expr.get()) && cseMap_.count(key))
+      es->expr = std::make_unique<VarExpr>(es->expr->loc, cseMap_[key]);
     return;
   }
   if (auto *decl = dynamic_cast<DeclStmt *>(stmt.get())) {
@@ -763,80 +793,85 @@ void Optimizer::eliminateSingleUseTemps(BlockStmt &block) {
   block.stmts = std::move(kept);
 }
 
-void Optimizer::substituteInExpr(Expr &expr,
-    const std::unordered_map<std::string, std::string> &copyMap) {
-  if (auto *var = dynamic_cast<VarExpr *>(&expr)) {
+void Optimizer::substituteInExpr(std::unique_ptr<Expr> &expr,
+    const std::unordered_map<std::string, std::unique_ptr<Expr>> &copyMap) {
+  if (auto *var = dynamic_cast<VarExpr *>(expr.get())) {
     auto it = copyMap.find(var->name);
-    if (it != copyMap.end()) var->name = it->second;
-  } else if (auto *un = dynamic_cast<UnaryExpr *>(&expr)) {
-    substituteInExpr(*un->operand, copyMap);
-  } else if (auto *bin = dynamic_cast<BinaryExpr *>(&expr)) {
-    substituteInExpr(*bin->lhs, copyMap);
-    substituteInExpr(*bin->rhs, copyMap);
-  } else if (auto *call = dynamic_cast<CallExpr *>(&expr)) {
+    if (it != copyMap.end()) { expr = cloneExpr(*it->second); return; }
+  } else if (auto *un = dynamic_cast<UnaryExpr *>(expr.get())) {
+    substituteInExpr(un->operand, copyMap);
+  } else if (auto *bin = dynamic_cast<BinaryExpr *>(expr.get())) {
+    substituteInExpr(bin->lhs, copyMap);
+    substituteInExpr(bin->rhs, copyMap);
+  } else if (auto *call = dynamic_cast<CallExpr *>(expr.get())) {
     for (auto &arg : call->args)
-      substituteInExpr(*arg, copyMap);
+      substituteInExpr(arg, copyMap);
   }
 }
 
 void Optimizer::substituteCopies(std::unique_ptr<Stmt> &stmt,
-    const std::unordered_map<std::string, std::string> &copyMap) {
+    const std::unordered_map<std::string, std::unique_ptr<Expr>> &copyMap) {
   if (copyMap.empty()) return;
   if (auto *block = dynamic_cast<BlockStmt *>(stmt.get())) {
     copyPropagate(*block);
   } else if (auto *decl = dynamic_cast<DeclStmt *>(stmt.get())) {
-    substituteInExpr(*decl->decl.init, copyMap);
+    substituteInExpr(decl->decl.init, copyMap);
   } else if (auto *es = dynamic_cast<ExprStmt *>(stmt.get())) {
-    substituteInExpr(*es->expr, copyMap);
+    substituteInExpr(es->expr, copyMap);
   } else if (auto *assign = dynamic_cast<AssignStmt *>(stmt.get())) {
-    substituteInExpr(*assign->value, copyMap);
+    substituteInExpr(assign->value, copyMap);
   } else if (auto *ifs = dynamic_cast<IfStmt *>(stmt.get())) {
-    substituteInExpr(*ifs->cond, copyMap);
+    substituteInExpr(ifs->cond, copyMap);
   } else if (auto *wh = dynamic_cast<WhileStmt *>(stmt.get())) {
-    substituteInExpr(*wh->cond, copyMap);
+    substituteInExpr(wh->cond, copyMap);
   } else if (auto *ret = dynamic_cast<ReturnStmt *>(stmt.get())) {
-    if (ret->value) substituteInExpr(*ret->value, copyMap);
+    if (ret->value) substituteInExpr(ret->value, copyMap);
   }
 }
 
 void Optimizer::copyPropagate(BlockStmt &block) {
-  for (auto &stmt : block.stmts) {
-    if (auto *inner = dynamic_cast<BlockStmt *>(stmt.get()))
-      copyPropagate(*inner);
-    else if (auto *ifs = dynamic_cast<IfStmt *>(stmt.get())) {
-      if (auto *b = dynamic_cast<BlockStmt *>(ifs->thenBranch.get()))
-        copyPropagate(*b);
-      if (ifs->elseBranch)
-        if (auto *b = dynamic_cast<BlockStmt *>(ifs->elseBranch.get()))
-          copyPropagate(*b);
-    } else if (auto *wh = dynamic_cast<WhileStmt *>(stmt.get())) {
-      if (auto *b = dynamic_cast<BlockStmt *>(wh->body.get()))
-        copyPropagate(*b);
-    }
-  }
-
-  std::unordered_map<std::string, std::string> copyMap;
+  std::unordered_map<std::string, std::unique_ptr<Expr>> copyMap;
   for (auto &stmt : block.stmts) {
     substituteCopies(stmt, copyMap);
 
     if (auto *decl = dynamic_cast<DeclStmt *>(stmt.get())) {
       if (!decl->decl.isConst) {
         if (auto *var = dynamic_cast<VarExpr *>(decl->decl.init.get()))
-          copyMap[decl->decl.name] = var->name;
-        else
-          copyMap.erase(decl->decl.name);
+          copyMap[decl->decl.name] = std::make_unique<VarExpr>(var->loc, var->name);
+        else {
+          int32_t v = 0;
+          if (number(*decl->decl.init, v))
+            copyMap[decl->decl.name] = std::make_unique<NumberExpr>(decl->decl.loc, v);
+          else
+            copyMap.erase(decl->decl.name);
+        }
       }
     } else if (auto *assign = dynamic_cast<AssignStmt *>(stmt.get())) {
       for (auto it = copyMap.begin(); it != copyMap.end(); ) {
-        if (it->second == assign->name) it = copyMap.erase(it);
-        else ++it;
+        if (auto *v = dynamic_cast<VarExpr *>(it->second.get())) {
+          if (v->name == assign->name) { it = copyMap.erase(it); continue; }
+        }
+        ++it;
       }
       if (auto *var = dynamic_cast<VarExpr *>(assign->value.get()))
-        copyMap[assign->name] = var->name;
-      else
-        copyMap.erase(assign->name);
+        copyMap[assign->name] = std::make_unique<VarExpr>(var->loc, var->name);
+      else {
+        int32_t v = 0;
+        if (number(*assign->value, v))
+          copyMap[assign->name] = std::make_unique<NumberExpr>(assign->loc, v);
+        else
+          copyMap.erase(assign->name);
+      }
+    } else if (dynamic_cast<IfStmt *>(stmt.get()) || dynamic_cast<WhileStmt *>(stmt.get())) {
+      // Dont clear for control flow - substituteCopies already handles it
     } else {
-      copyMap.clear();
+      // Clear variable-based entries, keep constant entries
+      for (auto it = copyMap.begin(); it != copyMap.end(); ) {
+        if (dynamic_cast<NumberExpr *>(it->second.get()))
+          ++it;
+        else
+          it = copyMap.erase(it);
+      }
     }
   }
 }

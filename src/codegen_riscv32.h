@@ -45,10 +45,14 @@ private:
   bool functionHasCall(const Function &fn) const;
   bool stmtHasCall(const Stmt &stmt) const;
   bool exprHasCall(const Expr &expr) const;
-  std::string allocVarReg();
+  std::string allocVarReg(const std::string &name = "");
   bool hasVarRegs() const;
+  int countStmtRefs(const Stmt &stmt, const std::string &name, int loopDepth) const;
+  int countExprRefs(const Expr &expr, const std::string &name) const;
+  void collectVarNames(const Stmt &stmt, std::vector<std::string> &names) const;
   std::string tempRegName(int depth) const;
   void emit(const std::string &line);
+  std::string peepholePass(const std::string &input) const;
   void emitData(const Program &program);
   void emitFunction(const Function &fn);
   void emitBlock(const BlockStmt &block, bool createScope);
@@ -78,6 +82,7 @@ private:
   bool currentLeaf_ = false;
   std::string currentReturnLabel_;
   std::unordered_map<int, std::string> loadedAtDepth_;
+  std::unordered_map<std::string, std::string> preAllocRegs_;
 };
 
 } // namespace toyc

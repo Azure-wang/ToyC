@@ -33,9 +33,9 @@ private:
   void eliminateSingleUseTemps(BlockStmt &block);
   void copyPropagate(BlockStmt &block);
   void substituteCopies(std::unique_ptr<Stmt> &stmt,
-      const std::unordered_map<std::string, std::string> &copyMap);
-  void substituteInExpr(Expr &expr,
-      const std::unordered_map<std::string, std::string> &copyMap);
+      const std::unordered_map<std::string, std::unique_ptr<Expr>> &copyMap);
+  void substituteInExpr(std::unique_ptr<Expr> &expr,
+      const std::unordered_map<std::string, std::unique_ptr<Expr>> &copyMap);
   void eliminateDeadStores(BlockStmt &block);
   void hoistLoopInvariants(BlockStmt &block);
   void computeModifiedVars(const Stmt &stmt, std::unordered_set<std::string> &vars) const;
