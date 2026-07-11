@@ -153,6 +153,13 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr) {
           return true;
         }
       }
+      if (auto *bin = dynamic_cast<BinaryExpr *>(un->operand.get())) {
+        if (bin->op == BinaryOp::Sub) {
+          expr = std::make_unique<BinaryExpr>(un->loc, BinaryOp::Sub,
+              std::move(bin->rhs), std::move(bin->lhs));
+          return true;
+        }
+      }
     }
     if (un->op == UnaryOp::Not) {
       if (auto *inner = dynamic_cast<UnaryExpr *>(un->operand.get())) {
@@ -244,8 +251,31 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr) {
     else if (bin->op == BinaryOp::Mul && hasA && a == -1) expr = std::make_unique<UnaryExpr>(bin->loc, UnaryOp::Minus, std::move(bin->rhs));
     else if (bin->op == BinaryOp::Mul && ((hasA && a == 0) || (hasB && b == 0))) expr = std::make_unique<NumberExpr>(bin->loc, 0);
     else if (bin->op == BinaryOp::Div && hasB && b == 1) expr = std::move(bin->lhs);
+    else if (bin->op == BinaryOp::Div && hasA && a == 0) expr = std::make_unique<NumberExpr>(bin->loc, 0);
     else if (bin->op == BinaryOp::Mod && hasB && b == 1) expr = std::make_unique<NumberExpr>(bin->loc, 0);
+    else if (bin->op == BinaryOp::Mod && hasA && a == 0) expr = std::make_unique<NumberExpr>(bin->loc, 0);
     else if (bin->op == BinaryOp::Sub) {
+      if (auto *lv = dynamic_cast<VarExpr *>(bin->lhs.get())) {
+        if (auto *rv = dynamic_cast<VarExpr *>(bin->rhs.get())) {
+          if (lv->name == rv->name) { expr = std::make_unique<NumberExpr>(bin->loc, 0); return true; }
+        }
+      }
+    }
+    else if (bin->op == BinaryOp::Lt || bin->op == BinaryOp::Gt) {
+      if (auto *lv = dynamic_cast<VarExpr *>(bin->lhs.get())) {
+        if (auto *rv = dynamic_cast<VarExpr *>(bin->rhs.get())) {
+          if (lv->name == rv->name) { expr = std::make_unique<NumberExpr>(bin->loc, 0); return true; }
+        }
+      }
+    }
+    else if (bin->op == BinaryOp::Le || bin->op == BinaryOp::Ge || bin->op == BinaryOp::Eq) {
+      if (auto *lv = dynamic_cast<VarExpr *>(bin->lhs.get())) {
+        if (auto *rv = dynamic_cast<VarExpr *>(bin->rhs.get())) {
+          if (lv->name == rv->name) { expr = std::make_unique<NumberExpr>(bin->loc, 1); return true; }
+        }
+      }
+    }
+    else if (bin->op == BinaryOp::Ne) {
       if (auto *lv = dynamic_cast<VarExpr *>(bin->lhs.get())) {
         if (auto *rv = dynamic_cast<VarExpr *>(bin->rhs.get())) {
           if (lv->name == rv->name) { expr = std::make_unique<NumberExpr>(bin->loc, 0); return true; }

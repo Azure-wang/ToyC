@@ -225,6 +225,28 @@ void RiscV32CodeGen::emitStmt(const Stmt &stmt) {
     if (!sym) error(assign->loc, "unknown variable '" + assign->name + "'");
     if (sym->isConst) error(assign->loc, "cannot assign const");
     if (optimize_ && !sym->reg.empty()) {
+      if (auto *var = dynamic_cast<const VarExpr *>(assign->value.get())) {
+        Symbol *rhs = lookup(var->name);
+        if (rhs) {
+          if (rhs->constValue) emit("li " + sym->reg + ", " + std::to_string(*rhs->constValue));
+          else if (!rhs->reg.empty()) emit("mv " + sym->reg + ", " + rhs->reg);
+          else if (rhs->isGlobal) { emit("la t0, " + rhs->label); emit("lw " + sym->reg + ", 0(t0)"); }
+          else emit("lw " + sym->reg + ", " + std::to_string(rhs->offset) + "(s0)");
+          return;
+        }
+      }
+      if (auto c = evalConst(*assign->value)) {
+        emit("li " + sym->reg + ", " + std::to_string(*c));
+        return;
+      }
+      if (auto *un = dynamic_cast<UnaryExpr *>(assign->value.get())) {
+        if (auto *uv = dynamic_cast<VarExpr *>(un->operand.get())) {
+          if (uv->name == assign->name) {
+            if (un->op == UnaryOp::Minus) { emit("neg " + sym->reg + ", " + sym->reg); return; }
+            if (un->op == UnaryOp::Not) { emit("seqz " + sym->reg + ", " + sym->reg); return; }
+          }
+        }
+      }
       if (auto *bin = dynamic_cast<BinaryExpr *>(assign->value.get())) {
         if (auto *lv = dynamic_cast<VarExpr *>(bin->lhs.get())) {
           if (lv->name == assign->name) {
@@ -298,6 +320,60 @@ void RiscV32CodeGen::emitStmt(const Stmt &stmt) {
         }
       }
     }
+    if (optimize_ && !sym->reg.empty()) {
+      if (auto *bin = dynamic_cast<BinaryExpr *>(assign->value.get())) {
+        if (auto *lv = dynamic_cast<const VarExpr *>(bin->lhs.get())) {
+          Symbol *ls = lookup(lv->name);
+          if (ls && !ls->reg.empty() && !exprHasCall(*assign->value)) {
+            if (auto *rv = dynamic_cast<const VarExpr *>(bin->rhs.get())) {
+              Symbol *rs = lookup(rv->name);
+              if (rs && !rs->reg.empty()) {
+                switch (bin->op) {
+                case BinaryOp::Add: emit("add " + sym->reg + ", " + ls->reg + ", " + rs->reg); return;
+                case BinaryOp::Sub: emit("sub " + sym->reg + ", " + ls->reg + ", " + rs->reg); return;
+                case BinaryOp::Mul: emit("mul " + sym->reg + ", " + ls->reg + ", " + rs->reg); return;
+                case BinaryOp::Div: emit("div " + sym->reg + ", " + ls->reg + ", " + rs->reg); return;
+                case BinaryOp::Mod: emit("rem " + sym->reg + ", " + ls->reg + ", " + rs->reg); return;
+                case BinaryOp::Lt: emit("slt " + sym->reg + ", " + ls->reg + ", " + rs->reg); return;
+                case BinaryOp::Gt: emit("slt " + sym->reg + ", " + rs->reg + ", " + ls->reg); return;
+                case BinaryOp::Le:
+                  emit("slt " + sym->reg + ", " + rs->reg + ", " + ls->reg);
+                  emit("xori " + sym->reg + ", " + sym->reg + ", 1");
+                  return;
+                case BinaryOp::Ge:
+                  emit("slt " + sym->reg + ", " + ls->reg + ", " + rs->reg);
+                  emit("xori " + sym->reg + ", " + sym->reg + ", 1");
+                  return;
+                case BinaryOp::Eq:
+                  emit("sub " + sym->reg + ", " + ls->reg + ", " + rs->reg);
+                  emit("seqz " + sym->reg + ", " + sym->reg);
+                  return;
+                case BinaryOp::Ne:
+                  emit("sub " + sym->reg + ", " + ls->reg + ", " + rs->reg);
+                  emit("snez " + sym->reg + ", " + sym->reg);
+                  return;
+                default: break;
+                }
+              }
+            }
+            if (auto c = evalConst(*bin->rhs)) {
+              if (bin->op == BinaryOp::Add && *c >= -2048 && *c <= 2047) {
+                emit("addi " + sym->reg + ", " + ls->reg + ", " + std::to_string(*c));
+                return;
+              }
+              if (bin->op == BinaryOp::Sub && *c >= -2047 && *c <= 2048) {
+                emit("addi " + sym->reg + ", " + ls->reg + ", " + std::to_string(-*c));
+                return;
+              }
+              if (bin->op == BinaryOp::Lt && *c >= -2048 && *c <= 2047) {
+                emit("slti " + sym->reg + ", " + ls->reg + ", " + std::to_string(*c));
+                return;
+              }
+            }
+          }
+        }
+      }
+    }
     emitExpr(*assign->value);
     storeTo(*sym, assign->loc);
   } else if (auto *ifs = dynamic_cast<const IfStmt *>(&stmt)) {
@@ -307,11 +383,10 @@ void RiscV32CodeGen::emitStmt(const Stmt &stmt) {
     emitCondition(*ifs->cond, thenL, ifs->elseBranch ? elseL : endL);
     text_ << thenL << ":\n";
     emitStmt(*ifs->thenBranch);
-    emit("j " + endL);
     if (ifs->elseBranch) {
+      emit("j " + endL);
       text_ << elseL << ":\n";
       emitStmt(*ifs->elseBranch);
-      emit("j " + endL);
     }
     text_ << endL << ":\n";
   } else if (auto *wh = dynamic_cast<const WhileStmt *>(&stmt)) {
@@ -319,7 +394,6 @@ void RiscV32CodeGen::emitStmt(const Stmt &stmt) {
     std::string bodyL = label("while_body");
     std::string endL = label("while_end");
     loops_.push_back(LoopLabels{condL, endL});
-    emit("j " + condL);
     text_ << condL << ":\n";
     emitCondition(*wh->cond, bodyL, endL);
     text_ << bodyL << ":\n";
@@ -418,6 +492,22 @@ void RiscV32CodeGen::emitExpr(const Expr &expr) {
     return;
   }
   if (auto *un = dynamic_cast<const UnaryExpr *>(&expr)) {
+    if (optimize_ && (un->op == UnaryOp::Minus || un->op == UnaryOp::Not)) {
+      if (auto *var = dynamic_cast<const VarExpr *>(un->operand.get())) {
+        if (Symbol *sym = lookup(var->name)) {
+          if (!sym->reg.empty()) {
+            if (un->op == UnaryOp::Minus) emit("neg a0, " + sym->reg);
+            else emit("seqz a0, " + sym->reg);
+            return;
+          }
+          if (sym->constValue) {
+            int32_t v = un->op == UnaryOp::Minus ? -(*sym->constValue) : (*sym->constValue == 0 ? 1 : 0);
+            emit("li a0, " + std::to_string(v));
+            return;
+          }
+        }
+      }
+    }
     emitExpr(*un->operand);
     if (un->op == UnaryOp::Minus) emit("neg a0, a0");
     else if (un->op == UnaryOp::Not) emit("seqz a0, a0");
