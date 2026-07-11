@@ -614,12 +614,45 @@ bool Optimizer::exprRefsModified(const Expr &expr,
 bool Optimizer::isInvariant(const Stmt &stmt,
     const std::unordered_set<std::string> &mustSet) const {
   if (auto *decl = dynamic_cast<const DeclStmt *>(&stmt))
-    return !exprRefsModified(*decl->decl.init, mustSet)
-        && mustSet.count(decl->decl.name) == 0;
+    return !exprRefsModified(*decl->decl.init, mustSet);
   if (auto *assign = dynamic_cast<const AssignStmt *>(&stmt))
     return !exprRefsModified(*assign->value, mustSet)
         && mustSet.count(assign->name) == 0;
   return false;
+}
+
+static void collectAssignedVars(const Stmt &stmt,
+    std::unordered_set<std::string> &vars) {
+  if (auto *block = dynamic_cast<const BlockStmt *>(&stmt)) {
+    for (const auto &s : block->stmts)
+      collectAssignedVars(*s, vars);
+  } else if (auto *assign = dynamic_cast<const AssignStmt *>(&stmt)) {
+    vars.insert(assign->name);
+  } else if (auto *ifs = dynamic_cast<const IfStmt *>(&stmt)) {
+    collectAssignedVars(*ifs->thenBranch, vars);
+    if (ifs->elseBranch) collectAssignedVars(*ifs->elseBranch, vars);
+  } else if (auto *wh = dynamic_cast<const WhileStmt *>(&stmt)) {
+    collectAssignedVars(*wh->body, vars);
+  }
+}
+
+void Optimizer::collectInnerDecls(const Stmt &stmt,
+    std::unordered_set<std::string> &decls) const {
+  if (auto *block = dynamic_cast<const BlockStmt *>(&stmt)) {
+    for (const auto &s : block->stmts) {
+      if (auto *inner = dynamic_cast<const BlockStmt *>(s.get())) {
+        for (const auto &ss : inner->stmts)
+          if (auto *d = dynamic_cast<const DeclStmt *>(ss.get()))
+            decls.insert(d->decl.name);
+        collectInnerDecls(*inner, decls);
+      } else if (auto *ifs = dynamic_cast<const IfStmt *>(s.get())) {
+        collectInnerDecls(*ifs->thenBranch, decls);
+        if (ifs->elseBranch) collectInnerDecls(*ifs->elseBranch, decls);
+      } else if (auto *wh = dynamic_cast<const WhileStmt *>(s.get())) {
+        collectInnerDecls(*wh->body, decls);
+      }
+    }
+  }
 }
 
 void Optimizer::hoistLoopInvariants(BlockStmt &block) {
@@ -644,12 +677,24 @@ void Optimizer::hoistLoopInvariants(BlockStmt &block) {
 
       std::unordered_set<std::string> mustSet;
       computeModifiedVars(*wh->body, mustSet);
-      collectReadVars(*wh->cond, mustSet); // add cond reads to mustSet
+      collectReadVars(*wh->cond, mustSet);
+
+      // Collect assigned vars (only AssignStmt, not DeclStmt) for DeclStmt check
+      std::unordered_set<std::string> assignedSet;
+      collectAssignedVars(*wh->body, assignedSet);
 
       // Find and hoist invariant statements
       std::vector<std::unique_ptr<Stmt>> keptBody;
       for (auto &bs : body->stmts) {
-        if (isInvariant(*bs, mustSet)) {
+        bool inv = false;
+        if (auto *decl = dynamic_cast<const DeclStmt *>(bs.get())) {
+          inv = !exprRefsModified(*decl->decl.init, mustSet)
+              && assignedSet.count(decl->decl.name) == 0;
+        } else if (auto *assign = dynamic_cast<const AssignStmt *>(bs.get())) {
+          inv = !exprRefsModified(*assign->value, mustSet)
+              && mustSet.count(assign->name) == 0;
+        }
+        if (inv) {
           newStmts.push_back(std::move(bs));
         } else {
           keptBody.push_back(std::move(bs));

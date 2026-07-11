@@ -188,19 +188,14 @@ void RiscV32CodeGen::emitFunction(const Function &fn) {
   currentFnName_ = fn.name;
   currentLeaf_ = !functionHasCall(fn);
   savedSRegs_ = optimize_ ? std::min(11, countMutableLocals(fn)) : 0;
-  int spillSlots = 12;
   int slots = optimize_ ? std::max(0, countSlots(fn) - savedSRegs_) : countSlots(fn);
-  slots += spillSlots;
   int fixedSaves = 1 + (currentLeaf_ ? 0 : 1) + savedSRegs_;
   frameSize_ = align16(4 * (slots + fixedSaves) + 16);
   nextOffset_ = -4 * (fixedSaves + 1);
   nextVarReg_ = 0;
   tempDepth_ = 0;
-  spillDepth_ = 0;
   currentReturnLabel_ = label("ret_" + sanitizeLabel(fn.name));
   tailBodyLabel_ = fn.name + "_body";
-  spillBase_ = nextOffset_;
-  for (int i = 0; i < spillSlots; ++i) nextOffset_ -= 4;
   currentParamNames_.clear();
   for (const auto &p : fn.params)
     currentParamNames_.push_back(p.name);
@@ -313,7 +308,7 @@ void RiscV32CodeGen::emitStmt(const Stmt &stmt) {
           for (size_t i = 0; i < currentParamNames_.size() && static_cast<int>(i) < n; ++i) {
             Symbol *sym = lookup(currentParamNames_[i]);
             if (!sym) continue;
-            int argOff = static_cast<int>(n - 1 - i) * 4;
+            int argOff = static_cast<int>(i) * 4;
             emit("lw a0, " + std::to_string(argOff) + "(sp)");
             storeTo(*sym, call.loc);
           }
@@ -488,12 +483,11 @@ void RiscV32CodeGen::emitExpr(const Expr &expr) {
       --tempDepth_;
     } else {
       emitExpr(*bin->lhs);
-      int spillOff = spillBase_ - spillDepth_ * 4;
-      ++spillDepth_;
-      emit("sw a0, " + std::to_string(spillOff) + "(s0)");
+      emit("addi sp, sp, -4");
+      emit("sw a0, 0(sp)");
       emitExpr(*bin->rhs);
-      --spillDepth_;
-      emit("lw t0, " + std::to_string(spillOff) + "(s0)");
+      emit("lw t0, 0(sp)");
+      emit("addi sp, sp, 4");
     }
     switch (bin->op) {
     case BinaryOp::Add: emit("add a0, " + lhsReg + ", a0"); break;
@@ -551,12 +545,11 @@ void RiscV32CodeGen::emitCondition(const Expr &expr, const std::string &trueLabe
         --tempDepth_;
       } else {
         emitExpr(*bin->lhs);
-        int spillOff = spillBase_ - spillDepth_ * 4;
-        ++spillDepth_;
-        emit("sw a0, " + std::to_string(spillOff) + "(s0)");
+        emit("addi sp, sp, -4");
+        emit("sw a0, 0(sp)");
         emitExpr(*bin->rhs);
-        --spillDepth_;
-        emit("lw t0, " + std::to_string(spillOff) + "(s0)");
+        emit("lw t0, 0(sp)");
+        emit("addi sp, sp, 4");
       }
       switch (bin->op) {
       case BinaryOp::Lt: emit("blt " + lhsReg + ", a0, " + trueLabel); break;

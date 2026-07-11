@@ -34,6 +34,7 @@ private:
   void eliminateDeadStores(BlockStmt &block);
   void hoistLoopInvariants(BlockStmt &block);
   void computeModifiedVars(const Stmt &stmt, std::unordered_set<std::string> &vars) const;
+  void collectInnerDecls(const Stmt &stmt, std::unordered_set<std::string> &decls) const;
   bool isInvariant(const Stmt &stmt, const std::unordered_set<std::string> &mustSet) const;
   bool exprRefsModified(const Expr &expr, const std::unordered_set<std::string> &mustSet) const;
   void collectReadVars(const Expr &expr, std::unordered_set<std::string> &vars) const;
