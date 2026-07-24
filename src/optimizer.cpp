@@ -197,6 +197,9 @@ bool Optimizer::optimizeStmt(std::unique_ptr<Stmt> &stmt, int depth) {
 bool Optimizer::optimizeBlock(BlockStmt &block) {
   bool anyChange = false;
   constTable_.push();
+  // Save parent value maps so inner-block tracking does not pollute the outer scope
+  auto savedVal = std::move(valueMap_);
+  auto savedCopy = std::move(copyMap_);
 
   // Iterative constant/copy propagation + folding + dead code
   for (int iter = 0; iter < 10; ++iter) {
@@ -252,6 +255,17 @@ bool Optimizer::optimizeBlock(BlockStmt &block) {
   eliminateDeadStores(block);
   hoistLoopInvariants(block);
 
+  // Restore parent value maps, discarding block-local entries
+  for (const auto &kv : valueMap_) {
+    if (savedVal.count(kv.first))
+      savedVal[kv.first] = kv.second;
+  }
+  for (const auto &kv : copyMap_) {
+    if (savedCopy.count(kv.first))
+      savedCopy[kv.first] = kv.second;
+  }
+  valueMap_ = std::move(savedVal);
+  copyMap_ = std::move(savedCopy);
   constTable_.pop();
   return anyChange;
 }
