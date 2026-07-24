@@ -8,22 +8,37 @@
 
 namespace toyc {
 
-static std::unique_ptr<Expr> cloneExpr(const Expr &expr) {
+static std::unique_ptr<Expr> cloneExpr(const Expr &expr, int depth) {
+  if (depth > 200) return nullptr;
   if (auto *num = dynamic_cast<const NumberExpr *>(&expr))
     return std::make_unique<NumberExpr>(num->loc, num->value);
   if (auto *var = dynamic_cast<const VarExpr *>(&expr))
     return std::make_unique<VarExpr>(var->loc, var->name);
-  if (auto *un = dynamic_cast<const UnaryExpr *>(&expr))
-    return std::make_unique<UnaryExpr>(un->loc, un->op, cloneExpr(*un->operand));
-  if (auto *bin = dynamic_cast<const BinaryExpr *>(&expr))
-    return std::make_unique<BinaryExpr>(bin->loc, bin->op,
-        cloneExpr(*bin->lhs), cloneExpr(*bin->rhs));
+  if (auto *un = dynamic_cast<const UnaryExpr *>(&expr)) {
+    auto op = cloneExpr(*un->operand, depth + 1);
+    if (!op) return nullptr;
+    return std::make_unique<UnaryExpr>(un->loc, un->op, std::move(op));
+  }
+  if (auto *bin = dynamic_cast<const BinaryExpr *>(&expr)) {
+    auto l = cloneExpr(*bin->lhs, depth + 1);
+    auto r = cloneExpr(*bin->rhs, depth + 1);
+    if (!l || !r) return nullptr;
+    return std::make_unique<BinaryExpr>(bin->loc, bin->op, std::move(l), std::move(r));
+  }
   if (auto *call = dynamic_cast<const CallExpr *>(&expr)) {
     std::vector<std::unique_ptr<Expr>> args;
-    for (const auto &a : call->args) args.push_back(cloneExpr(*a));
+    for (const auto &a : call->args) {
+      auto ca = cloneExpr(*a, depth + 1);
+      if (!ca) return nullptr;
+      args.push_back(std::move(ca));
+    }
     return std::make_unique<CallExpr>(call->loc, call->callee, std::move(args));
   }
   return nullptr;
+}
+
+static std::unique_ptr<Expr> cloneExpr(const Expr &expr) {
+  return cloneExpr(expr, 0);
 }
 
 void Optimizer::optimize(Program &program) {
@@ -36,67 +51,209 @@ void Optimizer::optimize(Program &program) {
         constTable_.declare(decl->decl.name, v);
     }
   }
-  for (auto &item : program.items) {
-    if (auto *fn = dynamic_cast<TopFunction *>(item.get())) {
-      optimizeBlock(*fn->func.body);
+
+  // Iterative intraprocedural optimization
+  for (int iter = 0; iter < 5; ++iter) {
+    bool changed = false;
+    for (auto &item : program.items) {
+      if (auto *fn = dynamic_cast<TopFunction *>(item.get())) {
+        if (optimizeBlock(*fn->func.body))
+          changed = true;
+      }
     }
+    if (!changed) break;
   }
+
   inlineCalls(program);
-  for (auto &item : program.items) {
-    if (auto *fn = dynamic_cast<TopFunction *>(item.get())) {
-      optimizeBlock(*fn->func.body);
+
+  // More iterations after inlining
+  for (int iter = 0; iter < 5; ++iter) {
+    bool changed = false;
+    for (auto &item : program.items) {
+      if (auto *fn = dynamic_cast<TopFunction *>(item.get())) {
+        if (optimizeBlock(*fn->func.body))
+          changed = true;
+      }
     }
+    if (!changed) break;
   }
+
   constTable_.pop();
 }
 
-void Optimizer::optimizeStmt(std::unique_ptr<Stmt> &stmt) {
-  if (auto *block = dynamic_cast<BlockStmt *>(stmt.get())) optimizeBlock(*block);
-  else if (auto *decl = dynamic_cast<DeclStmt *>(stmt.get())) {
-    foldExpr(decl->decl.init);
+bool Optimizer::optimizeStmt(std::unique_ptr<Stmt> &stmt) {
+  return optimizeStmt(stmt, 0);
+}
+
+bool Optimizer::optimizeStmt(std::unique_ptr<Stmt> &stmt, int depth) {
+  if (depth > 300) return false;
+
+  if (auto *block = dynamic_cast<BlockStmt *>(stmt.get()))
+    return optimizeBlock(*block);
+
+  if (auto *decl = dynamic_cast<DeclStmt *>(stmt.get())) {
+    bool changed = foldExpr(decl->decl.init);
     if (decl->decl.isConst) {
       int32_t v = 0;
-      if (number(*decl->decl.init, v)) constTable_.declare(decl->decl.name, v);
+      if (number(*decl->decl.init, v))
+        constTable_.declare(decl->decl.name, v);
+    } else {
+      invalidateVar(decl->decl.name);
+      int32_t v = 0;
+      if (number(*decl->decl.init, v))
+        valueMap_[decl->decl.name] = v;
+      else if (auto *var = dynamic_cast<VarExpr *>(decl->decl.init.get()))
+        copyMap_[decl->decl.name] = var->name;
     }
+    return changed;
   }
-  else if (auto *expr = dynamic_cast<ExprStmt *>(stmt.get())) foldExpr(expr->expr);
-  else if (auto *assign = dynamic_cast<AssignStmt *>(stmt.get())) foldExpr(assign->value);
-  else if (auto *ifs = dynamic_cast<IfStmt *>(stmt.get())) {
-    foldExpr(ifs->cond);
-    optimizeStmt(ifs->thenBranch);
-    if (ifs->elseBranch) optimizeStmt(ifs->elseBranch);
+
+  if (auto *es = dynamic_cast<ExprStmt *>(stmt.get())) {
+    // Function calls may have side effects; conservatively clear value maps
+    if (hasCall(*es->expr)) {
+      valueMap_.clear();
+      copyMap_.clear();
+    }
+    return foldExpr(es->expr);
+  }
+
+  if (auto *assign = dynamic_cast<AssignStmt *>(stmt.get())) {
+    bool changed = foldExpr(assign->value);
+    invalidateVar(assign->name);
+    int32_t v = 0;
+    if (number(*assign->value, v))
+      valueMap_[assign->name] = v;
+    else if (auto *var = dynamic_cast<VarExpr *>(assign->value.get()))
+      copyMap_[assign->name] = var->name;
+    return changed;
+  }
+
+  if (auto *ifs = dynamic_cast<IfStmt *>(stmt.get())) {
+    bool changed = foldExpr(ifs->cond);
     int32_t v = 0;
     if (number(*ifs->cond, v)) {
+      changed = true;
       if (v != 0) stmt = std::move(ifs->thenBranch);
       else if (ifs->elseBranch) stmt = std::move(ifs->elseBranch);
       else stmt = std::make_unique<EmptyStmt>(ifs->loc);
+      // Re-process the replacement
+      optimizeStmt(stmt, depth + 1);
+      return changed;
     }
-  } else if (auto *wh = dynamic_cast<WhileStmt *>(stmt.get())) {
-    foldExpr(wh->cond);
-    optimizeStmt(wh->body);
-    int32_t v = 0;
-    if (number(*wh->cond, v) && v == 0) stmt = std::make_unique<EmptyStmt>(wh->loc);
-  } else if (auto *ret = dynamic_cast<ReturnStmt *>(stmt.get())) {
-    if (ret->value) foldExpr(ret->value);
+    // Save maps, process then-branch
+    auto savedVal = valueMap_;
+    auto savedCopy = copyMap_;
+    changed |= optimizeStmt(ifs->thenBranch, depth + 1);
+    auto thenVal = std::move(valueMap_);
+    auto thenCopy = std::move(copyMap_);
+
+    if (ifs->elseBranch) {
+      valueMap_ = savedVal;
+      copyMap_ = savedCopy;
+      changed |= optimizeStmt(ifs->elseBranch, depth + 1);
+      // Merge: keep only entries that agree in both branches
+      for (auto it = valueMap_.begin(); it != valueMap_.end(); ) {
+        auto tit = thenVal.find(it->first);
+        if (tit == thenVal.end() || tit->second != it->second)
+          it = valueMap_.erase(it);
+        else
+          ++it;
+      }
+      // Conservatively clear copy map at merge points
+      copyMap_.clear();
+      thenCopy.clear();
+    } else {
+      // No else: values from then may not hold
+      valueMap_ = savedVal;
+      copyMap_ = savedCopy;
+    }
+    return changed;
   }
+
+  if (auto *wh = dynamic_cast<WhileStmt *>(stmt.get())) {
+    bool changed = foldExpr(wh->cond);
+    int32_t v = 0;
+    if (number(*wh->cond, v) && v == 0) {
+      stmt = std::make_unique<EmptyStmt>(wh->loc);
+      return true;
+    }
+    // Conservative: clear value maps for loop
+    valueMap_.clear();
+    copyMap_.clear();
+    changed |= optimizeStmt(wh->body, depth + 1);
+    valueMap_.clear();
+    copyMap_.clear();
+    return changed;
+  }
+
+  if (auto *ret = dynamic_cast<ReturnStmt *>(stmt.get())) {
+    if (ret->value) return foldExpr(ret->value);
+    return false;
+  }
+
+  return false;
 }
 
-void Optimizer::optimizeBlock(BlockStmt &block) {
+bool Optimizer::optimizeBlock(BlockStmt &block) {
+  bool anyChange = false;
   constTable_.push();
-  std::vector<std::unique_ptr<Stmt>> kept;
-  bool dead = false;
-  for (auto &stmt : block.stmts) {
-    if (dead) continue;
-    optimizeStmt(stmt);
-    dead = isTerminator(*stmt);
-    kept.push_back(std::move(stmt));
+
+  // Iterative constant/copy propagation + folding + dead code
+  for (int iter = 0; iter < 10; ++iter) {
+    bool changed = false;
+    valueMap_.clear();
+    copyMap_.clear();
+
+    // Process each statement, tracking values
+    bool dead = false;
+    for (auto &stmt : block.stmts) {
+      if (dead) continue;
+      if (optimizeStmt(stmt)) changed = true;
+      dead = isTerminator(*stmt);
+    }
+
+    // Remove dead code after terminators
+    std::vector<std::unique_ptr<Stmt>> kept;
+    dead = false;
+    for (auto &stmt : block.stmts) {
+      if (dead) { changed = true; continue; }
+      dead = isTerminator(*stmt);
+      kept.push_back(std::move(stmt));
+    }
+    if (kept.size() != block.stmts.size()) {
+      changed = true;
+      block.stmts = std::move(kept);
+    }
+
+    // Remove empty statements
+    {
+      std::vector<std::unique_ptr<Stmt>> nonEmpty;
+      for (auto &stmt : block.stmts) {
+        if (dynamic_cast<EmptyStmt *>(stmt.get())) { changed = true; continue; }
+        // Flatten empty blocks
+        if (auto *b = dynamic_cast<BlockStmt *>(stmt.get())) {
+          if (b->stmts.empty()) { changed = true; continue; }
+        }
+        nonEmpty.push_back(std::move(stmt));
+      }
+      if (nonEmpty.size() != block.stmts.size()) {
+        changed = true;
+        block.stmts = std::move(nonEmpty);
+      }
+    }
+
+    anyChange = anyChange || changed;
+    if (!changed) break;
   }
-  block.stmts = std::move(kept);
-  constTable_.pop();
+
+  // More expensive passes (once after fixed point)
   hoistCommonSubexprs(block);
   cseBlock(block);
   eliminateDeadStores(block);
   hoistLoopInvariants(block);
+
+  constTable_.pop();
+  return anyChange;
 }
 
 bool Optimizer::isTerminator(const Stmt &stmt) const {
@@ -119,31 +276,44 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr) {
 
 bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr, int depth) {
   if (depth > 400) return false;
+
   if (auto *var = dynamic_cast<VarExpr *>(expr.get())) {
     int32_t v = 0;
     if (number(*var, v)) {
       expr = std::make_unique<NumberExpr>(var->loc, v);
       return true;
     }
+    // Follow copy chain to replace with source var
+    auto it = copyMap_.find(var->name);
+    if (it != copyMap_.end() && it->second != var->name) {
+      var->name = it->second;
+      return foldExpr(expr, depth + 1);
+    }
     return false;
   }
+
   if (auto *call = dynamic_cast<CallExpr *>(expr.get())) {
-    for (auto &arg : call->args) foldExpr(arg, depth + 1);
-    return false;
+    bool changed = false;
+    for (auto &arg : call->args)
+      if (foldExpr(arg, depth + 1)) changed = true;
+    return changed;
   }
+
   if (dynamic_cast<NumberExpr *>(expr.get())) return false;
 
   if (auto *un = dynamic_cast<UnaryExpr *>(expr.get())) {
-    foldExpr(un->operand, depth + 1);
+    bool changed = foldExpr(un->operand, depth + 1);
     int32_t v = 0;
     if (number(*un->operand, v)) {
       expr = std::make_unique<NumberExpr>(un->loc, applyUnary(un->op, v));
       return true;
     }
+    // +x → x
     if (un->op == UnaryOp::Plus) {
       expr = std::move(un->operand);
       return true;
     }
+    // -(-x) → x
     if (un->op == UnaryOp::Minus) {
       if (auto *inner = dynamic_cast<UnaryExpr *>(un->operand.get())) {
         if (inner->op == UnaryOp::Minus) {
@@ -151,76 +321,119 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr, int depth) {
           return true;
         }
       }
+      // -(x - y) → y - x  (simplify codegen)
+      if (auto *inner = dynamic_cast<BinaryExpr *>(un->operand.get())) {
+        if (inner->op == BinaryOp::Sub) {
+          auto y = std::move(inner->rhs);
+          auto x = std::move(inner->lhs);
+          expr = std::make_unique<BinaryExpr>(un->loc, BinaryOp::Sub, std::move(y), std::move(x));
+          return foldExpr(expr, depth + 1);
+        }
+      }
     }
-    return false;
+    // !0 → 1, !N → 0
+    return changed;
   }
+
   if (auto *bin = dynamic_cast<BinaryExpr *>(expr.get())) {
-    foldExpr(bin->lhs, depth + 1);
-    foldExpr(bin->rhs, depth + 1);
+    bool changed = foldExpr(bin->lhs, depth + 1);
+    changed |= foldExpr(bin->rhs, depth + 1);
+
+    // x + (-y) → x - y
     if (bin->op == BinaryOp::Add) {
       if (auto *rhsNeg = dynamic_cast<UnaryExpr *>(bin->rhs.get())) {
         if (rhsNeg->op == UnaryOp::Minus) {
           bin->op = BinaryOp::Sub;
           bin->rhs = std::move(rhsNeg->operand);
-          foldExpr(expr, depth + 1);
-          return true;
+          return foldExpr(expr, depth + 1);
         }
       }
       if (auto *lhsNeg = dynamic_cast<UnaryExpr *>(bin->lhs.get())) {
         if (lhsNeg->op == UnaryOp::Minus) {
           bin->op = BinaryOp::Sub;
-          bin->lhs = std::move(bin->rhs);
+          auto x = std::move(bin->rhs);
           bin->rhs = std::move(lhsNeg->operand);
-          foldExpr(expr, depth + 1);
-          return true;
+          bin->lhs = std::move(x);
+          return foldExpr(expr, depth + 1);
         }
       }
     }
+
+    // x - (-y) → x + y
+    if (bin->op == BinaryOp::Sub) {
+      if (auto *rhsNeg = dynamic_cast<UnaryExpr *>(bin->rhs.get())) {
+        if (rhsNeg->op == UnaryOp::Minus) {
+          bin->op = BinaryOp::Add;
+          bin->rhs = std::move(rhsNeg->operand);
+          return foldExpr(expr, depth + 1);
+        }
+      }
+    }
+
     int32_t a = 0, b = 0;
     bool hasA = number(*bin->lhs, a);
     bool hasB = number(*bin->rhs, b);
+
+    // Both constant → fold
     if (hasA && hasB) {
       expr = std::make_unique<NumberExpr>(bin->loc, applyBinary(bin->op, a, b));
       return true;
     }
+
+    // Commute Mul and Add for constant-on-right
     if ((bin->op == BinaryOp::Mul || bin->op == BinaryOp::Add) && hasA && !hasB) {
       std::swap(bin->lhs, bin->rhs);
       std::swap(a, b);
       std::swap(hasA, hasB);
+      changed = true;
     }
-    if (hasA && !hasB && bin->op == BinaryOp::Sub) {
-      // C - x → (-x) + C
-      auto x = std::move(bin->rhs);
-      auto neg = std::make_unique<UnaryExpr>(bin->loc, UnaryOp::Minus, std::move(x));
-      expr = std::make_unique<BinaryExpr>(bin->loc, BinaryOp::Add,
-          std::move(neg), std::move(bin->lhs));
-      foldExpr(expr, depth + 1);
-      return true;
+
+    // Identity rules (constant on RHS)
+    if (hasB) {
+      if (bin->op == BinaryOp::Add && b == 0) { expr = std::move(bin->lhs); return true; }
+      if (bin->op == BinaryOp::Sub && b == 0) { expr = std::move(bin->lhs); return true; }
+      if (bin->op == BinaryOp::Mul && b == 1) { expr = std::move(bin->lhs); return true; }
+      if (bin->op == BinaryOp::Mul && b == 0) { expr = std::make_unique<NumberExpr>(bin->loc, 0); return true; }
+      if (bin->op == BinaryOp::Div && b == 1) { expr = std::move(bin->lhs); return true; }
+      if (bin->op == BinaryOp::Div && b == -1) {
+        expr = std::make_unique<UnaryExpr>(bin->loc, UnaryOp::Minus, std::move(bin->lhs));
+        return foldExpr(expr, depth + 1);
+      }
+      if (bin->op == BinaryOp::Mod && b == 1) { expr = std::make_unique<NumberExpr>(bin->loc, 0); return true; }
     }
-    if (bin->op == BinaryOp::Add && hasB && b == 0) expr = std::move(bin->lhs);
-    else if (bin->op == BinaryOp::Add && hasA && a == 0) expr = std::move(bin->rhs);
-    else if (bin->op == BinaryOp::Sub && hasB && b == 0) expr = std::move(bin->lhs);
-    else if (bin->op == BinaryOp::Mul && hasB && b == 1) expr = std::move(bin->lhs);
-    else if (bin->op == BinaryOp::Mul && hasA && a == 1) expr = std::move(bin->rhs);
-    else if (bin->op == BinaryOp::Mul && ((hasA && a == 0) || (hasB && b == 0))) expr = std::make_unique<NumberExpr>(bin->loc, 0);
-    else if (bin->op == BinaryOp::Div && hasB && b == 1) expr = std::move(bin->lhs);
-    else if (bin->op == BinaryOp::Mod && hasB && b == 1) expr = std::make_unique<NumberExpr>(bin->loc, 0);
-    else if (bin->op == BinaryOp::Sub) {
+
+    // Identity rules (constant on LHS — for Sub and Div)
+    if (hasA) {
+      if (bin->op == BinaryOp::Add && a == 0) { expr = std::move(bin->rhs); return true; }
+      // 0 - x → -x
+      if (bin->op == BinaryOp::Sub && a == 0) {
+        expr = std::make_unique<UnaryExpr>(bin->loc, UnaryOp::Minus, std::move(bin->rhs));
+        return foldExpr(expr, depth + 1);
+      }
+      if (bin->op == BinaryOp::Mul && a == 0) { expr = std::make_unique<NumberExpr>(bin->loc, 0); return true; }
+      if (bin->op == BinaryOp::Mul && a == 1) { expr = std::move(bin->rhs); return true; }
+      // 0 / x → 0
+      if (bin->op == BinaryOp::Div && a == 0) { expr = std::make_unique<NumberExpr>(bin->loc, 0); return true; }
+    }
+
+    // x - x → 0 (same variable)
+    if (bin->op == BinaryOp::Sub) {
       if (auto *lv = dynamic_cast<VarExpr *>(bin->lhs.get())) {
         if (auto *rv = dynamic_cast<VarExpr *>(bin->rhs.get())) {
           if (lv->name == rv->name) { expr = std::make_unique<NumberExpr>(bin->loc, 0); return true; }
         }
       }
     }
+
+    // Associativity: (x op C1) op C2 → x op (C1 op C2)
     if (hasB) {
       if (auto *inner = dynamic_cast<BinaryExpr *>(bin->lhs.get())) {
         int32_t c = 0;
         if ((inner->op == BinaryOp::Add || inner->op == BinaryOp::Sub)
             && number(*inner->rhs, c)) {
           if (bin->op == BinaryOp::Add || bin->op == BinaryOp::Sub) {
-            int32_t d = (bin->op == BinaryOp::Add)
-                ? ((inner->op == BinaryOp::Add) ? (c + b) : (b - c))
-                : ((inner->op == BinaryOp::Add) ? (c - b) : (-c - b));
+            int32_t d = applyBinary(bin->op,
+                (inner->op == BinaryOp::Add) ? c : -c, b);
             auto x = std::move(inner->lhs);
             if (d == 0) expr = std::move(x);
             else if (d > 0)
@@ -232,14 +445,31 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr, int depth) {
             return true;
           }
         }
+        // (x * C1) * C2 → x * (C1 * C2)
+        if (inner->op == BinaryOp::Mul && bin->op == BinaryOp::Mul
+            && number(*inner->rhs, c)) {
+          auto x = std::move(inner->lhs);
+          int32_t d = wrap32(static_cast<int64_t>(c) * b);
+          if (d == 0) { expr = std::make_unique<NumberExpr>(bin->loc, 0); return true; }
+          if (d == 1) { expr = std::move(x); return true; }
+          if (d == -1) {
+            expr = std::make_unique<UnaryExpr>(bin->loc, UnaryOp::Minus, std::move(x));
+            return true;
+          }
+          expr = std::make_unique<BinaryExpr>(bin->loc, BinaryOp::Mul,
+              std::move(x), std::make_unique<NumberExpr>(bin->loc, d));
+          return true;
+        }
       }
     }
+
+    // C1 + (x + C2) → x + (C1 + C2)
     if (hasA && bin->op == BinaryOp::Add) {
       if (auto *inner = dynamic_cast<BinaryExpr *>(bin->rhs.get())) {
         int32_t c = 0;
         if ((inner->op == BinaryOp::Add || inner->op == BinaryOp::Sub)
             && number(*inner->rhs, c)) {
-          int32_t d = (inner->op == BinaryOp::Add) ? (a + c) : (a - c);
+          int32_t d = inner->op == BinaryOp::Add ? (a + c) : (a - c);
           auto x = std::move(inner->lhs);
           if (d == 0) expr = std::move(x);
           else if (d > 0)
@@ -250,10 +480,22 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr, int depth) {
                 std::move(x), std::make_unique<NumberExpr>(bin->loc, -d));
           return true;
         }
+        // C1 * (x * C2) → x * (C1 * C2)
+        if (inner->op == BinaryOp::Mul && number(*inner->rhs, c)) {
+          auto x = std::move(inner->lhs);
+          int32_t d = wrap32(static_cast<int64_t>(a) * c);
+          if (d == 0) { expr = std::make_unique<NumberExpr>(bin->loc, 0); return true; }
+          if (d == 1) { expr = std::move(x); return true; }
+          expr = std::make_unique<BinaryExpr>(bin->loc, BinaryOp::Mul,
+              std::move(x), std::make_unique<NumberExpr>(bin->loc, d));
+          return true;
+        }
       }
     }
-    return false;
+
+    return changed;
   }
+
   return false;
 }
 
@@ -263,24 +505,52 @@ bool Optimizer::number(const Expr &expr, int32_t &value) const {
     return true;
   }
   if (auto *var = dynamic_cast<const VarExpr *>(&expr)) {
+    // Check const table first
     auto *v = constTable_.find(var->name);
     if (v) { value = *v; return true; }
+    // Check mutable value map
+    auto it = valueMap_.find(var->name);
+    if (it != valueMap_.end()) { value = it->second; return true; }
+    // Follow copy chain
+    auto cit = copyMap_.find(var->name);
+    if (cit != copyMap_.end()) {
+      // Resolve copy chain (with cycle detection)
+      std::string target = cit->second;
+      std::unordered_set<std::string> visited;
+      visited.insert(var->name);
+      while (true) {
+        auto *cv = constTable_.find(target);
+        if (cv) { value = *cv; return true; }
+        auto vit = valueMap_.find(target);
+        if (vit != valueMap_.end()) { value = vit->second; return true; }
+        auto nit = copyMap_.find(target);
+        if (nit == copyMap_.end()) break;
+        if (visited.count(target)) break;
+        visited.insert(target);
+        target = nit->second;
+      }
+    }
   }
   return false;
 }
 
 std::string Optimizer::exprKey(const Expr &expr) const {
+  return exprKey(expr, 0);
+}
+
+std::string Optimizer::exprKey(const Expr &expr, int depth) const {
+  if (depth > 200) return "";
   if (auto *num = dynamic_cast<const NumberExpr *>(&expr))
     return "\x01N" + std::to_string(num->value);
   if (auto *var = dynamic_cast<const VarExpr *>(&expr))
     return "\x01V" + var->name + "\x01";
   if (auto *un = dynamic_cast<const UnaryExpr *>(&expr))
-    return "\x01U" + std::to_string(static_cast<int>(un->op)) + exprKey(*un->operand);
+    return "\x01U" + std::to_string(static_cast<int>(un->op)) + exprKey(*un->operand, depth + 1);
   if (auto *bin = dynamic_cast<const BinaryExpr *>(&expr))
-    return "\x01B" + std::to_string(static_cast<int>(bin->op)) + exprKey(*bin->lhs) + exprKey(*bin->rhs);
+    return "\x01B" + std::to_string(static_cast<int>(bin->op)) + exprKey(*bin->lhs, depth + 1) + exprKey(*bin->rhs, depth + 1);
   if (auto *call = dynamic_cast<const CallExpr *>(&expr)) {
     std::string key = "\x01C" + call->callee;
-    for (const auto &arg : call->args) key += exprKey(*arg);
+    for (const auto &arg : call->args) key += exprKey(*arg, depth + 1);
     return key;
   }
   return "";
@@ -294,6 +564,18 @@ static void invalidateVar(std::unordered_map<std::string, std::string> &m, const
     else
       ++it;
   }
+}
+
+void Optimizer::invalidateVar(const std::string &name) {
+  valueMap_.erase(name);
+  // Remove copy entries where the target is 'name'
+  for (auto it = copyMap_.begin(); it != copyMap_.end(); ) {
+    if (it->second == name)
+      it = copyMap_.erase(it);
+    else
+      ++it;
+  }
+  copyMap_.erase(name);
 }
 
 void Optimizer::cseBlock(BlockStmt &block) {
@@ -469,11 +751,11 @@ bool Optimizer::hoistInStmt(std::unique_ptr<Stmt> &stmt, int &cseCounter,
   }
 
   for (auto &kv : newTemps) {
-    Decl decl;
-    decl.loc = loc;
-    decl.name = kv.first;
-    decl.init = std::move(kv.second);
-    preStmts.push_back(std::make_unique<DeclStmt>(loc, std::move(decl)));
+    Decl dec;
+    dec.loc = loc;
+    dec.name = kv.first;
+    dec.init = std::move(kv.second);
+    preStmts.push_back(std::make_unique<DeclStmt>(loc, std::move(dec)));
   }
   return !newTemps.empty();
 }
@@ -515,8 +797,6 @@ void Optimizer::collectReadVars(const Expr &expr,
 void Optimizer::collectReadVars(const Stmt &stmt,
     std::unordered_set<std::string> &vars) const {
   if (auto *block = dynamic_cast<const BlockStmt *>(&stmt)) {
-    // For inner blocks, collect from all statements
-    // but only top-level liveness crosses block boundaries
     for (const auto &s : block->stmts)
       collectReadVars(*s, vars);
   } else if (auto *es = dynamic_cast<const ExprStmt *>(&stmt))
@@ -557,6 +837,11 @@ void Optimizer::eliminateDeadStores(BlockStmt &block) {
   std::unordered_set<std::string> live;
   for (auto it = block.stmts.rbegin(); it != block.stmts.rend(); ++it) {
     auto &stmt = *it;
+    if (auto *ret = dynamic_cast<ReturnStmt *>(stmt.get())) {
+      if (ret->value) collectReadVars(*ret->value, live);
+      live.clear(); // Return kills liveness of earlier vars
+      continue;
+    }
     collectReadVars(*stmt, live);
     if (auto *assign = dynamic_cast<AssignStmt *>(stmt.get())) {
       if (!live.count(assign->name)) {
@@ -611,31 +896,6 @@ bool Optimizer::exprRefsModified(const Expr &expr,
   return false;
 }
 
-bool Optimizer::isInvariant(const Stmt &stmt,
-    const std::unordered_set<std::string> &mustSet) const {
-  if (auto *decl = dynamic_cast<const DeclStmt *>(&stmt))
-    return !exprRefsModified(*decl->decl.init, mustSet);
-  if (auto *assign = dynamic_cast<const AssignStmt *>(&stmt))
-    return !exprRefsModified(*assign->value, mustSet)
-        && mustSet.count(assign->name) == 0;
-  return false;
-}
-
-static void collectAssignedVars(const Stmt &stmt,
-    std::unordered_set<std::string> &vars) {
-  if (auto *block = dynamic_cast<const BlockStmt *>(&stmt)) {
-    for (const auto &s : block->stmts)
-      collectAssignedVars(*s, vars);
-  } else if (auto *assign = dynamic_cast<const AssignStmt *>(&stmt)) {
-    vars.insert(assign->name);
-  } else if (auto *ifs = dynamic_cast<const IfStmt *>(&stmt)) {
-    collectAssignedVars(*ifs->thenBranch, vars);
-    if (ifs->elseBranch) collectAssignedVars(*ifs->elseBranch, vars);
-  } else if (auto *wh = dynamic_cast<const WhileStmt *>(&stmt)) {
-    collectAssignedVars(*wh->body, vars);
-  }
-}
-
 void Optimizer::collectInnerDecls(const Stmt &stmt,
     std::unordered_set<std::string> &decls) const {
   if (auto *block = dynamic_cast<const BlockStmt *>(&stmt)) {
@@ -655,6 +915,21 @@ void Optimizer::collectInnerDecls(const Stmt &stmt,
   }
 }
 
+static void collectAssignedVars(const Stmt &stmt,
+    std::unordered_set<std::string> &vars) {
+  if (auto *block = dynamic_cast<const BlockStmt *>(&stmt)) {
+    for (const auto &s : block->stmts)
+      collectAssignedVars(*s, vars);
+  } else if (auto *assign = dynamic_cast<const AssignStmt *>(&stmt)) {
+    vars.insert(assign->name);
+  } else if (auto *ifs = dynamic_cast<const IfStmt *>(&stmt)) {
+    collectAssignedVars(*ifs->thenBranch, vars);
+    if (ifs->elseBranch) collectAssignedVars(*ifs->elseBranch, vars);
+  } else if (auto *wh = dynamic_cast<const WhileStmt *>(&stmt)) {
+    collectAssignedVars(*wh->body, vars);
+  }
+}
+
 void Optimizer::hoistLoopInvariants(BlockStmt &block) {
   // Recurse first (inner loops first)
   for (auto &stmt : block.stmts) {
@@ -668,7 +943,6 @@ void Optimizer::hoistLoopInvariants(BlockStmt &block) {
       hoistLoopInvariants(*inner);
     }
   }
-  // Now process while loops in this block and hoist invariants
   std::vector<std::unique_ptr<Stmt>> newStmts;
   for (auto &stmt : block.stmts) {
     if (auto *wh = dynamic_cast<WhileStmt *>(stmt.get())) {
@@ -679,11 +953,9 @@ void Optimizer::hoistLoopInvariants(BlockStmt &block) {
       computeModifiedVars(*wh->body, mustSet);
       collectReadVars(*wh->cond, mustSet);
 
-      // Collect assigned vars (only AssignStmt, not DeclStmt) for DeclStmt check
       std::unordered_set<std::string> assignedSet;
       collectAssignedVars(*wh->body, assignedSet);
 
-      // Find and hoist invariant statements
       std::vector<std::unique_ptr<Stmt>> keptBody;
       for (auto &bs : body->stmts) {
         bool inv = false;
@@ -711,31 +983,51 @@ void Optimizer::hoistLoopInvariants(BlockStmt &block) {
 // ─── Function inlining ───────────────────────────────────────────
 
 std::unique_ptr<Stmt> Optimizer::cloneStmt(const Stmt &stmt) {
+  return cloneStmt(stmt, 0);
+}
+
+std::unique_ptr<Stmt> Optimizer::cloneStmt(const Stmt &stmt, int depth) {
+  if (depth > 200) return nullptr;
   if (auto *block = dynamic_cast<const BlockStmt *>(&stmt))
-    return cloneBlock(*block);
+    return cloneBlock(*block, depth + 1);
   if (auto *decl = dynamic_cast<const DeclStmt *>(&stmt)) {
     Decl d;
     d.loc = decl->decl.loc;
     d.isConst = decl->decl.isConst;
     d.name = decl->decl.name;
     d.init = cloneExpr(*decl->decl.init);
+    if (!d.init) return nullptr;
     return std::make_unique<DeclStmt>(decl->loc, std::move(d));
   }
-  if (auto *es = dynamic_cast<const ExprStmt *>(&stmt))
-    return std::make_unique<ExprStmt>(es->loc, cloneExpr(*es->expr));
-  if (auto *assign = dynamic_cast<const AssignStmt *>(&stmt))
-    return std::make_unique<AssignStmt>(assign->loc, assign->name,
-        cloneExpr(*assign->value));
-  if (auto *ifs = dynamic_cast<const IfStmt *>(&stmt))
-    return std::make_unique<IfStmt>(ifs->loc, cloneExpr(*ifs->cond),
-        cloneStmt(*ifs->thenBranch),
-        ifs->elseBranch ? cloneStmt(*ifs->elseBranch) : nullptr);
-  if (auto *wh = dynamic_cast<const WhileStmt *>(&stmt))
-    return std::make_unique<WhileStmt>(wh->loc, cloneExpr(*wh->cond),
-        cloneStmt(*wh->body));
-  if (auto *ret = dynamic_cast<const ReturnStmt *>(&stmt))
-    return std::make_unique<ReturnStmt>(ret->loc,
-        ret->value ? cloneExpr(*ret->value) : nullptr);
+  if (auto *es = dynamic_cast<const ExprStmt *>(&stmt)) {
+    auto e = cloneExpr(*es->expr);
+    if (!e) return nullptr;
+    return std::make_unique<ExprStmt>(es->loc, std::move(e));
+  }
+  if (auto *assign = dynamic_cast<const AssignStmt *>(&stmt)) {
+    auto v = cloneExpr(*assign->value);
+    if (!v) return nullptr;
+    return std::make_unique<AssignStmt>(assign->loc, assign->name, std::move(v));
+  }
+  if (auto *ifs = dynamic_cast<const IfStmt *>(&stmt)) {
+    auto c = cloneExpr(*ifs->cond);
+    auto t = cloneStmt(*ifs->thenBranch, depth + 1);
+    if (!c || !t) return nullptr;
+    auto e = ifs->elseBranch ? cloneStmt(*ifs->elseBranch, depth + 1) : nullptr;
+    if (ifs->elseBranch && !e) return nullptr;
+    return std::make_unique<IfStmt>(ifs->loc, std::move(c), std::move(t), std::move(e));
+  }
+  if (auto *wh = dynamic_cast<const WhileStmt *>(&stmt)) {
+    auto c = cloneExpr(*wh->cond);
+    auto b = cloneStmt(*wh->body, depth + 1);
+    if (!c || !b) return nullptr;
+    return std::make_unique<WhileStmt>(wh->loc, std::move(c), std::move(b));
+  }
+  if (auto *ret = dynamic_cast<const ReturnStmt *>(&stmt)) {
+    auto v = ret->value ? cloneExpr(*ret->value) : nullptr;
+    if (ret->value && !v) return nullptr;
+    return std::make_unique<ReturnStmt>(ret->loc, std::move(v));
+  }
   if (dynamic_cast<const BreakStmt *>(&stmt))
     return std::make_unique<BreakStmt>(stmt.loc);
   if (dynamic_cast<const ContinueStmt *>(&stmt))
@@ -746,9 +1038,17 @@ std::unique_ptr<Stmt> Optimizer::cloneStmt(const Stmt &stmt) {
 }
 
 std::unique_ptr<BlockStmt> Optimizer::cloneBlock(const BlockStmt &block) {
+  return cloneBlock(block, 0);
+}
+
+std::unique_ptr<BlockStmt> Optimizer::cloneBlock(const BlockStmt &block, int depth) {
+  if (depth > 200) return nullptr;
   auto b = std::make_unique<BlockStmt>(block.loc);
-  for (const auto &s : block.stmts)
-    b->stmts.push_back(cloneStmt(*s));
+  for (const auto &s : block.stmts) {
+    auto cs = cloneStmt(*s, depth + 1);
+    if (!cs) return nullptr;
+    b->stmts.push_back(std::move(cs));
+  }
   return b;
 }
 
@@ -853,16 +1153,12 @@ static void collectLocalNames(const Stmt &stmt,
   }
 }
 
-static const int MAX_INLINE_DEPTH = 8;
-
 std::unique_ptr<Expr> Optimizer::inlineInExpr(std::unique_ptr<Expr> expr,
     const std::unordered_map<std::string, const Function *> &funcMap,
     const std::string &currentFn,
     std::vector<std::unique_ptr<Stmt>> &preStmts,
     int &counter, SourceLoc loc) {
-  // Guard against excessive inlining depth
   if (counter > 200) return expr;
-  // Bottom-up: recurse first
   if (auto *un = dynamic_cast<UnaryExpr *>(expr.get())) {
     un->operand = inlineInExpr(std::move(un->operand),
         funcMap, currentFn, preStmts, counter, loc);
@@ -872,11 +1168,9 @@ std::unique_ptr<Expr> Optimizer::inlineInExpr(std::unique_ptr<Expr> expr,
     bin->rhs = inlineInExpr(std::move(bin->rhs),
         funcMap, currentFn, preStmts, counter, loc);
   } else if (auto *call = dynamic_cast<CallExpr *>(expr.get())) {
-    // Inline arguments first
     for (auto &arg : call->args)
       arg = inlineInExpr(std::move(arg), funcMap, currentFn,
           preStmts, counter, loc);
-    // Check if this call can be inlined
     auto it = funcMap.find(call->callee);
     if (it != funcMap.end() && call->callee != currentFn &&
         isInlinable(*it->second)) {
@@ -890,6 +1184,7 @@ std::unique_ptr<Expr> Optimizer::inlineInExpr(std::unique_ptr<Expr> expr,
       for (const auto &name : localNames)
         rmap[name] = prefix + name;
       auto cloned = cloneBlock(*fn.body);
+      if (!cloned) return expr; // Safety: give up on overflow
       renameInStmt(*cloned, rmap);
       auto &lastStmt = cloned->stmts.back();
       ReturnStmt *ret = dynamic_cast<ReturnStmt *>(lastStmt.get());
@@ -971,7 +1266,6 @@ void Optimizer::inlineCalls(Program &program) {
     if (auto *tf = dynamic_cast<TopFunction *>(item.get()))
       funcMap[tf->func.name] = &tf->func;
   }
-  // Detect mutual/simple recursion and mark for no inlining
   for (auto &kv : funcMap) {
     for (auto &kv2 : funcMap) {
       if (kv.first == kv2.first) continue;
@@ -982,7 +1276,6 @@ void Optimizer::inlineCalls(Program &program) {
       }
     }
   }
-  // Remove non-inlinable functions from the map
   for (const auto &name : noInline) funcMap.erase(name);
   bool changed = true;
   int counter = 0;

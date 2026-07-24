@@ -122,29 +122,44 @@ All compiler errors throw `CompileError` with line and column where available. `
 
 Optimizations are enabled only when the compiler receives `-opt`.
 
+Iterative fixed-point optimization:
+The optimizer runs constant folding, constant/copy propagation, and dead code elimination in a loop until no more changes occur (up to 10 iterations per block, 5 iterations per function across the whole program). This catches cascading optimization opportunities — for example, constant propagation reveals dead branches, whose elimination reveals more constant expressions, etc.
+
 Constant folding:
-Expressions whose operands are integer literals are folded in `optimizer.*`.
+Expressions whose operands are integer literals are folded in `optimizer.*`. The folder also handles constant-valued mutable variables through the value tracking map.
 
 Constant propagation:
-Global and local constants are stored in the symbol table and emitted as immediates instead of loads.
+Const-qualified variables are tracked in a scoped symbol table. Mutable variables assigned constant values are tracked in an intra-block value map. When a variable is looked up during folding, both the const table and the mutable value map are consulted. Copy chains (`x = y`) are followed to find the ultimate source value.
 
-Dead code deletion:
-Statements after `return`, `break`, or `continue` in a block are removed by the optimizer.
+Copy propagation:
+When a variable is assigned from another variable (`x = y`), the copy relationship is recorded in a copy map. Subsequent uses of `x` are replaced with `y`, and if `y` in turn has a known constant value, the constant is propagated through.
+
+Dead code elimination:
+Statements after `return`, `break`, or `continue` in a block are removed by the optimizer. After constant propagation, branch conditions that evaluate to constants are replaced with unconditional branches or removed entirely, enabling more dead code elimination. Dead stores (assignments to variables never read again) are also removed.
 
 Common subexpression elimination / local value numbering:
-The current implementation does not include a full LVN table. It does reduce repeated memory traffic by using a `t0-t6` expression temporary stack for nested binary expressions whose RHS cannot call a function. This is not semantic CSE for `(a + b) * (a + b)`, but it removes many stack push/pop pairs.
+The implementation tracks expression keys across statements within a basic block. When the same expression is computed in multiple declarations or assignments, the second occurrence is replaced with a reference to the first result. Additionally, repeated subexpressions within a single expression are hoisted into temporary variables via `hoistCommonSubexprs`.
 
 Register allocation / reduced memory traffic:
 In `-opt`, parameters and most mutable locals are allocated to `s1-s11`; short-lived expression operands use `t0-t6`. Stack slots are used for spills, globals, and call argument overflow. Normal mode remains stack-oriented for easier debugging and as a correctness baseline.
 
 Branch optimization:
-Under `-opt`, compile-time constant conditions lower directly to unconditional jumps. Constant false `while` loops are removed at the AST level. Comparisons used directly by `if` and `while` generate RISC-V branch sequences instead of first materializing 0/1.
+Under `-opt`, compile-time constant conditions lower directly to unconditional jumps. Constant false `while` loops are removed at the AST level. Constant-true `if` statements are replaced with their `then` branch; constant-false `if` statements are replaced with their `else` branch (or removed). Comparisons used directly by `if` and `while` generate RISC-V branch sequences instead of first materializing 0/1.
 
 Algebraic simplification:
-The optimizer handles `x + 0`, `0 + x`, `x - 0`, `x * 1`, `1 * x`, `x * 0`, `0 * x`, `x / 1`, and `x % 1`.
+The optimizer handles `x + 0`, `0 + x`, `x - 0`, `x * 1`, `1 * x`, `x * 0`, `0 * x`, `x / 1`, `x % 1`, `0 - x → -x`, `x - x → 0`, `x / -1 → -x`, `-(-x) → x`, `x + (-y) → x - y`, `(-x) + y → y - x`, `x - (-y) → x + y`, `-(x - y) → y - x`, as well as associativity: `(x + C1) + C2 → x + (C1+C2)`, `(x * C1) * C2 → x * (C1*C2)`, and similar patterns with the constant on either side.
+
+Loop-invariant code motion:
+Statements inside `while` loops whose operands are not modified by the loop body and which do not assign to loop-modified variables are hoisted before the loop.
+
+Function inlining:
+Small functions (up to 10 statements) that do not call themselves are inlined at call sites. Mutually recursive functions are excluded. Inlined functions are renamed with a unique prefix to avoid name conflicts.
+
+Tail call optimization:
+Self-recursive tail calls are optimized by updating parameters in-place and jumping to the function body label, avoiding stack frame growth. Non-recursive tail calls with up to 8 arguments are optimized by reusing the current stack frame before jumping to the callee.
 
 Instruction selection and peephole:
-Small `x + c` and `x - c` cases use `addi` when the immediate fits. Obvious no-op algebraic cases are removed before codegen. Jump-to-next-label and label coalescing are not yet implemented as a separate text peephole pass.
+Small `x + c` and `x - c` cases use `addi` when the immediate fits. Multiplication and division by powers of 2 use shift instructions. Obvious no-op algebraic cases are removed before codegen. Jump-to-next-label pairs are removed in the peephole pass.
 
 ## 14. Testing Method
 

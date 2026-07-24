@@ -316,27 +316,26 @@ void RiscV32CodeGen::emitStmt(const Stmt &stmt) {
           emit("j " + tailBodyLabel_);
           return;
         }
-        // Non-recursive tail call
-        for (int i = n - 1; i >= 0; --i) {
-          emitExpr(*call.args[static_cast<size_t>(i)]);
-          emit("addi sp, sp, -4");
-          emit("sw a0, 0(sp)");
+        // Non-recursive tail call — only safe without extra stack args
+        if (n <= 8) {
+          for (int i = n - 1; i >= 0; --i) {
+            emitExpr(*call.args[static_cast<size_t>(i)]);
+            emit("addi sp, sp, -4");
+            emit("sw a0, 0(sp)");
+          }
+          for (int i = 0; i < n; ++i)
+            emit("lw a" + std::to_string(i) + ", " + std::to_string(i * 4) + "(sp)");
+          if (n > 0) emit("addi sp, sp, " + std::to_string(n * 4));
+          for (int i = savedSRegs_ - 1; i >= 0; --i) {
+            int slot = currentLeaf_ ? (8 + i * 4) : (12 + i * 4);
+            emit("lw s" + std::to_string(i + 1) + ", -" + std::to_string(slot) + "(s0)");
+          }
+          if (!currentLeaf_) emit("lw ra, -4(s0)");
+          emit("lw s0, -" + std::to_string(currentLeaf_ ? 4 : 8) + "(s0)");
+          emit("addi sp, sp, " + std::to_string(frameSize_));
+          emit("j " + call.callee);
+          return;
         }
-        int regArgs = std::min(n, 8);
-        for (int i = 0; i < regArgs; ++i)
-          emit("lw a" + std::to_string(i) + ", " + std::to_string(i * 4) + "(sp)");
-        if (regArgs > 0) emit("addi sp, sp, " + std::to_string(regArgs * 4));
-        int extra = n - regArgs;
-        if (extra > 0) emit("addi sp, sp, " + std::to_string(extra * 4));
-        for (int i = savedSRegs_ - 1; i >= 0; --i) {
-          int slot = currentLeaf_ ? (8 + i * 4) : (12 + i * 4);
-          emit("lw s" + std::to_string(i + 1) + ", -" + std::to_string(slot) + "(s0)");
-        }
-        if (!currentLeaf_) emit("lw ra, -4(s0)");
-        emit("lw s0, -" + std::to_string(currentLeaf_ ? 4 : 8) + "(s0)");
-        emit("addi sp, sp, " + std::to_string(frameSize_));
-        emit("j " + call.callee);
-        return;
       }
       emitExpr(*ret->value);
     } else {
