@@ -66,13 +66,24 @@ bool Optimizer::optimizeStmt(std::unique_ptr<Stmt> &stmt, int depth) {
     if (decl->decl.isConst) {
       int32_t v = 0;
       if (number(*decl->decl.init, v)) constTable_.declare(decl->decl.name, v);
+    } else {
+      int32_t v = 0;
+      if (number(*decl->decl.init, v)) valueMap_[decl->decl.name] = v;
+      else valueMap_.erase(decl->decl.name);
     }
     return changed;
   }
   if (auto *expr = dynamic_cast<ExprStmt *>(stmt.get())) return foldExpr(expr->expr);
-  if (auto *assign = dynamic_cast<AssignStmt *>(stmt.get())) return foldExpr(assign->value);
+  if (auto *assign = dynamic_cast<AssignStmt *>(stmt.get())) {
+    bool changed = foldExpr(assign->value);
+    int32_t v = 0;
+    if (number(*assign->value, v)) valueMap_[assign->name] = v;
+    else valueMap_.erase(assign->name);
+    return changed;
+  }
   if (auto *ifs = dynamic_cast<IfStmt *>(stmt.get())) {
     bool changed = foldExpr(ifs->cond);
+    valueMap_.clear();
     changed |= optimizeStmt(ifs->thenBranch, depth + 1);
     if (ifs->elseBranch) changed |= optimizeStmt(ifs->elseBranch, depth + 1);
     int32_t v = 0;
@@ -92,6 +103,7 @@ bool Optimizer::optimizeStmt(std::unique_ptr<Stmt> &stmt, int depth) {
     return changed;
   }
   if (auto *wh = dynamic_cast<WhileStmt *>(stmt.get())) {
+    valueMap_.clear();
     bool changed = foldExpr(wh->cond);
     changed |= optimizeStmt(wh->body, depth + 1);
     int32_t v = 0;
@@ -113,6 +125,8 @@ bool Optimizer::optimizeStmt(std::unique_ptr<Stmt> &stmt, int depth) {
 
 void Optimizer::optimizeBlock(BlockStmt &block) {
   constTable_.push();
+  auto savedValueMap = std::move(valueMap_);
+  valueMap_.clear();
   for (int iter = 0; iter < 5; ++iter) {
     bool changed = false;
     for (auto &stmt : block.stmts)
@@ -133,6 +147,7 @@ void Optimizer::optimizeBlock(BlockStmt &block) {
   cseBlock(block);
   eliminateDeadStores(block);
   hoistLoopInvariants(block);
+  valueMap_ = std::move(savedValueMap);
 }
 
 bool Optimizer::isTerminator(const Stmt &stmt) const {
@@ -243,6 +258,27 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr, int depth) {
       std::swap(hasA, hasB);
     }
     if (hasA && !hasB && bin->op == BinaryOp::Sub) {
+      // C - (x + D) → (C-D) - x
+      if (auto *inner = dynamic_cast<BinaryExpr *>(bin->rhs.get())) {
+        int32_t c = 0;
+        if (inner->op == BinaryOp::Add && number(*inner->rhs, c)) {
+          int32_t d = a - c;
+          auto x = std::move(inner->lhs);
+          expr = std::make_unique<BinaryExpr>(bin->loc, BinaryOp::Sub,
+              std::make_unique<NumberExpr>(bin->loc, d), std::move(x));
+          foldExpr(expr, depth + 1);
+          return true;
+        }
+        if (inner->op == BinaryOp::Sub && number(*inner->rhs, c)) {
+          // C - (x - D) → (C+D) - x
+          int32_t d = a + c;
+          auto x = std::move(inner->lhs);
+          expr = std::make_unique<BinaryExpr>(bin->loc, BinaryOp::Sub,
+              std::make_unique<NumberExpr>(bin->loc, d), std::move(x));
+          foldExpr(expr, depth + 1);
+          return true;
+        }
+      }
       // C - x → (-x) + C
       auto x = std::move(bin->rhs);
       auto neg = std::make_unique<UnaryExpr>(bin->loc, UnaryOp::Minus, std::move(x));
@@ -361,6 +397,8 @@ bool Optimizer::number(const Expr &expr, int32_t &value) const {
   if (auto *var = dynamic_cast<const VarExpr *>(&expr)) {
     auto *v = constTable_.find(var->name);
     if (v) { value = *v; return true; }
+    auto it = valueMap_.find(var->name);
+    if (it != valueMap_.end()) { value = it->second; return true; }
   }
   return false;
 }
@@ -404,16 +442,25 @@ void Optimizer::cseBlock(BlockStmt &block) {
 
 void Optimizer::cseStmt(std::unique_ptr<Stmt> &stmt) {
   if (auto *block = dynamic_cast<BlockStmt *>(stmt.get())) {
-    cseBlock(*block);
+    auto saved = cseMap_;
+    for (auto &s : block->stmts) cseStmt(s);
+    cseMap_ = std::move(saved);
     return;
   }
   if (auto *ifs = dynamic_cast<IfStmt *>(stmt.get())) {
+    auto saved = cseMap_;
     cseStmt(ifs->thenBranch);
-    if (ifs->elseBranch) cseStmt(ifs->elseBranch);
+    if (ifs->elseBranch) {
+      cseMap_ = saved;
+      cseStmt(ifs->elseBranch);
+    }
+    cseMap_ = std::move(saved);
     return;
   }
   if (auto *wh = dynamic_cast<WhileStmt *>(stmt.get())) {
+    auto saved = cseMap_;
     cseStmt(wh->body);
+    cseMap_ = std::move(saved);
     return;
   }
   if (auto *decl = dynamic_cast<DeclStmt *>(stmt.get())) {
@@ -639,22 +686,6 @@ void Optimizer::collectReadVars(const Stmt &stmt,
 }
 
 void Optimizer::eliminateDeadStores(BlockStmt &block) {
-  // Recurse into nested blocks first
-  for (auto &stmt : block.stmts) {
-    if (auto *inner = dynamic_cast<BlockStmt *>(stmt.get()))
-      eliminateDeadStores(*inner);
-    else if (auto *ifs = dynamic_cast<IfStmt *>(stmt.get())) {
-      if (auto *b = dynamic_cast<BlockStmt *>(ifs->thenBranch.get()))
-        eliminateDeadStores(*b);
-      if (ifs->elseBranch)
-        if (auto *b = dynamic_cast<BlockStmt *>(ifs->elseBranch.get()))
-          eliminateDeadStores(*b);
-    } else if (auto *wh = dynamic_cast<WhileStmt *>(stmt.get())) {
-      if (auto *b = dynamic_cast<BlockStmt *>(wh->body.get()))
-        eliminateDeadStores(*b);
-    }
-  }
-
   std::unordered_set<std::string> live;
   for (auto it = block.stmts.rbegin(); it != block.stmts.rend(); ++it) {
     auto &stmt = *it;
@@ -771,6 +802,11 @@ void Optimizer::hoistLoopInvariants(BlockStmt &block) {
   }
   // Now process while loops in this block and hoist invariants
   std::vector<std::unique_ptr<Stmt>> newStmts;
+  std::unordered_set<std::string> outerDecls;
+  for (auto &stmt : block.stmts) {
+    if (auto *decl = dynamic_cast<const DeclStmt *>(stmt.get()))
+      outerDecls.insert(decl->decl.name);
+  }
   for (auto &stmt : block.stmts) {
     if (auto *wh = dynamic_cast<WhileStmt *>(stmt.get())) {
       auto *body = dynamic_cast<BlockStmt *>(wh->body.get());
@@ -790,12 +826,15 @@ void Optimizer::hoistLoopInvariants(BlockStmt &block) {
         bool inv = false;
         if (auto *decl = dynamic_cast<const DeclStmt *>(bs.get())) {
           inv = !exprRefsModified(*decl->decl.init, mustSet)
-              && assignedSet.count(decl->decl.name) == 0;
+              && assignedSet.count(decl->decl.name) == 0
+              && outerDecls.count(decl->decl.name) == 0;
         } else if (auto *assign = dynamic_cast<const AssignStmt *>(bs.get())) {
           inv = !exprRefsModified(*assign->value, mustSet)
               && mustSet.count(assign->name) == 0;
         }
         if (inv) {
+          if (auto *decl = dynamic_cast<const DeclStmt *>(bs.get()))
+            outerDecls.insert(decl->decl.name);
           newStmts.push_back(std::move(bs));
         } else {
           keptBody.push_back(std::move(bs));

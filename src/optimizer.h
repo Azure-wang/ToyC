@@ -64,6 +64,7 @@ private:
 
   ScopedTable<int32_t> constTable_;
   std::unordered_map<std::string, std::string> cseMap_;
+  std::unordered_map<std::string, int32_t> valueMap_;
 };
 
 } // namespace toyc
