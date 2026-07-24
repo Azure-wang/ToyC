@@ -60,6 +60,7 @@ private:
   Symbol *lookup(const std::string &name);
   void storeTo(const Symbol &sym, SourceLoc loc);
   std::optional<int32_t> evalConst(const Expr &expr);
+  std::optional<int32_t> evalConst(const Expr &expr, int depth);
   int32_t applyUnary(UnaryOp op, int32_t v) const;
   int32_t applyBinary(BinaryOp op, int32_t a, int32_t b) const;
   std::string peepholeOptimize(const std::string &code);
@@ -83,6 +84,7 @@ private:
   std::string currentFnName_;
   std::string tailBodyLabel_;
   std::vector<std::string> currentParamNames_;
+  std::vector<Symbol> currentParamSyms_;
 };
 
 } // namespace toyc

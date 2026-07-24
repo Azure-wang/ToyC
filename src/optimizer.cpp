@@ -82,9 +82,9 @@ bool Optimizer::optimizeStmt(std::unique_ptr<Stmt> &stmt, int depth) {
       else stmt = std::make_unique<EmptyStmt>(ifs->loc);
       return true;
     }
-    // Remove empty branches
+    // Remove empty then-branch if no else and condition has no side effects
     if (auto *tb = dynamic_cast<BlockStmt *>(ifs->thenBranch.get())) {
-      if (tb->stmts.empty() && !ifs->elseBranch) {
+      if (tb->stmts.empty() && !ifs->elseBranch && !hasSideEffects(*ifs->cond)) {
         stmt = std::make_unique<EmptyStmt>(ifs->loc);
         return true;
       }
@@ -96,9 +96,11 @@ bool Optimizer::optimizeStmt(std::unique_ptr<Stmt> &stmt, int depth) {
     changed |= optimizeStmt(wh->body, depth + 1);
     int32_t v = 0;
     if (number(*wh->cond, v) && v == 0) { stmt = std::make_unique<EmptyStmt>(wh->loc); return true; }
-    // Remove empty loop body
+    // Remove empty loop body only if condition has no side effects
     if (auto *b = dynamic_cast<BlockStmt *>(wh->body.get())) {
-      if (b->stmts.empty()) { stmt = std::make_unique<EmptyStmt>(wh->loc); return true; }
+      if (b->stmts.empty() && !hasSideEffects(*wh->cond)) {
+        stmt = std::make_unique<EmptyStmt>(wh->loc); return true;
+      }
     }
     return changed;
   }
@@ -364,17 +366,22 @@ bool Optimizer::number(const Expr &expr, int32_t &value) const {
 }
 
 std::string Optimizer::exprKey(const Expr &expr) const {
+  return exprKey(expr, 0);
+}
+
+std::string Optimizer::exprKey(const Expr &expr, int depth) const {
+  if (depth > 200) return "";
   if (auto *num = dynamic_cast<const NumberExpr *>(&expr))
     return "\x01N" + std::to_string(num->value);
   if (auto *var = dynamic_cast<const VarExpr *>(&expr))
     return "\x01V" + var->name + "\x01";
   if (auto *un = dynamic_cast<const UnaryExpr *>(&expr))
-    return "\x01U" + std::to_string(static_cast<int>(un->op)) + exprKey(*un->operand);
+    return "\x01U" + std::to_string(static_cast<int>(un->op)) + exprKey(*un->operand, depth + 1);
   if (auto *bin = dynamic_cast<const BinaryExpr *>(&expr))
-    return "\x01B" + std::to_string(static_cast<int>(bin->op)) + exprKey(*bin->lhs) + exprKey(*bin->rhs);
+    return "\x01B" + std::to_string(static_cast<int>(bin->op)) + exprKey(*bin->lhs, depth + 1) + exprKey(*bin->rhs, depth + 1);
   if (auto *call = dynamic_cast<const CallExpr *>(&expr)) {
     std::string key = "\x01C" + call->callee;
-    for (const auto &arg : call->args) key += exprKey(*arg);
+    for (const auto &arg : call->args) key += exprKey(*arg, depth + 1);
     return key;
   }
   return "";
@@ -897,29 +904,31 @@ bool Optimizer::isInlinable(const Function &fn) {
     if (auto *inner = dynamic_cast<const BlockStmt *>(s.get()))
       stmtCount += static_cast<int>(inner->stmts.size()) - 1;
   }
-  return stmtCount <= 10;
+  return stmtCount <= 5;
 }
 
 static void renameInExpr(Expr &expr,
-    const std::unordered_map<std::string, std::string> &rmap) {
+    const std::unordered_map<std::string, std::string> &rmap, int depth = 0) {
+  if (depth > 200) return;
   if (auto *var = dynamic_cast<VarExpr *>(&expr)) {
     auto it = rmap.find(var->name);
     if (it != rmap.end()) var->name = it->second;
   } else if (auto *un = dynamic_cast<UnaryExpr *>(&expr)) {
-    renameInExpr(*un->operand, rmap);
+    renameInExpr(*un->operand, rmap, depth + 1);
   } else if (auto *bin = dynamic_cast<BinaryExpr *>(&expr)) {
-    renameInExpr(*bin->lhs, rmap);
-    renameInExpr(*bin->rhs, rmap);
+    renameInExpr(*bin->lhs, rmap, depth + 1);
+    renameInExpr(*bin->rhs, rmap, depth + 1);
   } else if (auto *call = dynamic_cast<CallExpr *>(&expr)) {
     for (auto &arg : call->args)
-      renameInExpr(*arg, rmap);
+      renameInExpr(*arg, rmap, depth + 1);
   }
 }
 
 static void renameInStmt(Stmt &stmt,
-    const std::unordered_map<std::string, std::string> &rmap) {
+    const std::unordered_map<std::string, std::string> &rmap, int depth = 0) {
+  if (depth > 200) return;
   if (auto *block = dynamic_cast<BlockStmt *>(&stmt)) {
-    for (auto &s : block->stmts) renameInStmt(*s, rmap);
+    for (auto &s : block->stmts) renameInStmt(*s, rmap, depth + 1);
   } else if (auto *decl = dynamic_cast<DeclStmt *>(&stmt)) {
     auto it = rmap.find(decl->decl.name);
     if (it != rmap.end()) decl->decl.name = it->second;
@@ -932,11 +941,11 @@ static void renameInStmt(Stmt &stmt,
     renameInExpr(*assign->value, rmap);
   } else if (auto *ifs = dynamic_cast<IfStmt *>(&stmt)) {
     renameInExpr(*ifs->cond, rmap);
-    renameInStmt(*ifs->thenBranch, rmap);
-    if (ifs->elseBranch) renameInStmt(*ifs->elseBranch, rmap);
+    renameInStmt(*ifs->thenBranch, rmap, depth + 1);
+    if (ifs->elseBranch) renameInStmt(*ifs->elseBranch, rmap, depth + 1);
   } else if (auto *wh = dynamic_cast<WhileStmt *>(&stmt)) {
     renameInExpr(*wh->cond, rmap);
-    renameInStmt(*wh->body, rmap);
+    renameInStmt(*wh->body, rmap, depth + 1);
   } else if (auto *ret = dynamic_cast<ReturnStmt *>(&stmt)) {
     if (ret->value) renameInExpr(*ret->value, rmap);
   }
@@ -957,15 +966,15 @@ static void collectLocalNames(const Stmt &stmt,
   }
 }
 
-static const int MAX_INLINE_DEPTH = 8;
+static const int MAX_INLINE_DEPTH = 4;
 
 std::unique_ptr<Expr> Optimizer::inlineInExpr(std::unique_ptr<Expr> expr,
     const std::unordered_map<std::string, const Function *> &funcMap,
     const std::string &currentFn,
     std::vector<std::unique_ptr<Stmt>> &preStmts,
     int &counter, SourceLoc loc) {
-  // Guard against excessive inlining depth
-  if (counter > 200) return expr;
+  // Guard against excessive inlining
+  if (counter > 50) return expr;
   // Bottom-up: recurse first
   if (auto *un = dynamic_cast<UnaryExpr *>(expr.get())) {
     un->operand = inlineInExpr(std::move(un->operand),
@@ -1090,7 +1099,7 @@ void Optimizer::inlineCalls(Program &program) {
   for (const auto &name : noInline) funcMap.erase(name);
   bool changed = true;
   int counter = 0;
-  int maxIter = 5;
+  int maxIter = 3;
   while (changed && maxIter-- > 0) {
     changed = false;
     for (auto &item : program.items) {

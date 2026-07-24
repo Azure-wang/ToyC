@@ -197,6 +197,7 @@ void RiscV32CodeGen::emitFunction(const Function &fn) {
   currentReturnLabel_ = label("ret_" + sanitizeLabel(fn.name));
   tailBodyLabel_ = fn.name + "_body";
   currentParamNames_.clear();
+  currentParamSyms_.clear();
   for (const auto &p : fn.params)
     currentParamNames_.push_back(p.name);
 
@@ -220,6 +221,7 @@ void RiscV32CodeGen::emitFunction(const Function &fn) {
       nextOffset_ -= 4;
     }
     symbols_.declare(fn.params[i].name, sym);
+    currentParamSyms_.push_back(sym);
     if (i < 8) {
       if (!sym.reg.empty()) emit("mv " + sym.reg + ", a" + std::to_string(i));
       else emit("sw a" + std::to_string(i) + ", " + std::to_string(sym.offset) + "(s0)");
@@ -305,12 +307,10 @@ void RiscV32CodeGen::emitStmt(const Stmt &stmt) {
             emit("addi sp, sp, -4");
             emit("sw a0, 0(sp)");
           }
-          for (size_t i = 0; i < currentParamNames_.size() && static_cast<int>(i) < n; ++i) {
-            Symbol *sym = lookup(currentParamNames_[i]);
-            if (!sym) continue;
+          for (size_t i = 0; i < currentParamSyms_.size() && static_cast<int>(i) < n; ++i) {
             int argOff = static_cast<int>(i) * 4;
             emit("lw a0, " + std::to_string(argOff) + "(sp)");
-            storeTo(*sym, call.loc);
+            storeTo(currentParamSyms_[i], call.loc);
           }
           if (n > 0) emit("addi sp, sp, " + std::to_string(n * 4));
           emit("j " + tailBodyLabel_);
@@ -602,6 +602,11 @@ void RiscV32CodeGen::storeTo(const Symbol &sym, SourceLoc loc) {
 }
 
 std::optional<int32_t> RiscV32CodeGen::evalConst(const Expr &expr) {
+  return evalConst(expr, 0);
+}
+
+std::optional<int32_t> RiscV32CodeGen::evalConst(const Expr &expr, int depth) {
+  if (depth > 200) return std::nullopt;
   if (auto *num = dynamic_cast<const NumberExpr *>(&expr)) return num->value;
   if (auto *var = dynamic_cast<const VarExpr *>(&expr)) {
     Symbol *sym = lookup(var->name);
@@ -609,13 +614,13 @@ std::optional<int32_t> RiscV32CodeGen::evalConst(const Expr &expr) {
     return std::nullopt;
   }
   if (auto *un = dynamic_cast<const UnaryExpr *>(&expr)) {
-    auto v = evalConst(*un->operand);
+    auto v = evalConst(*un->operand, depth + 1);
     if (!v) return std::nullopt;
     return applyUnary(un->op, *v);
   }
   if (auto *bin = dynamic_cast<const BinaryExpr *>(&expr)) {
-    auto a = evalConst(*bin->lhs);
-    auto b = evalConst(*bin->rhs);
+    auto a = evalConst(*bin->lhs, depth + 1);
+    auto b = evalConst(*bin->rhs, depth + 1);
     if (!a || !b) return std::nullopt;
     return applyBinary(bin->op, *a, *b);
   }
