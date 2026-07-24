@@ -91,6 +91,12 @@ bool Optimizer::optimizeStmt(std::unique_ptr<Stmt> &stmt, int depth) {
       if (v != 0) stmt = std::move(ifs->thenBranch);
       else if (ifs->elseBranch) stmt = std::move(ifs->elseBranch);
       else stmt = std::make_unique<EmptyStmt>(ifs->loc);
+      // Wrap DeclStmt in a BlockStmt to prevent name conflicts with parent scope
+      if (dynamic_cast<DeclStmt *>(stmt.get())) {
+        auto block = std::make_unique<BlockStmt>(stmt->loc);
+        block->stmts.push_back(std::move(stmt));
+        stmt = std::move(block);
+      }
       return true;
     }
     // Remove empty then-branch if no else and condition has no side effects
@@ -262,7 +268,7 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr, int depth) {
       if (auto *inner = dynamic_cast<BinaryExpr *>(bin->rhs.get())) {
         int32_t c = 0;
         if (inner->op == BinaryOp::Add && number(*inner->rhs, c)) {
-          int32_t d = a - c;
+          int32_t d = wrap32(static_cast<int64_t>(a) - c);
           auto x = std::move(inner->lhs);
           expr = std::make_unique<BinaryExpr>(bin->loc, BinaryOp::Sub,
               std::make_unique<NumberExpr>(bin->loc, d), std::move(x));
@@ -271,7 +277,7 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr, int depth) {
         }
         if (inner->op == BinaryOp::Sub && number(*inner->rhs, c)) {
           // C - (x - D) → (C+D) - x
-          int32_t d = a + c;
+          int32_t d = wrap32(static_cast<int64_t>(a) + c);
           auto x = std::move(inner->lhs);
           expr = std::make_unique<BinaryExpr>(bin->loc, BinaryOp::Sub,
               std::make_unique<NumberExpr>(bin->loc, d), std::move(x));
@@ -279,13 +285,6 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr, int depth) {
           return true;
         }
       }
-      // C - x → (-x) + C
-      auto x = std::move(bin->rhs);
-      auto neg = std::make_unique<UnaryExpr>(bin->loc, UnaryOp::Minus, std::move(x));
-      expr = std::make_unique<BinaryExpr>(bin->loc, BinaryOp::Add,
-          std::move(neg), std::move(bin->lhs));
-      foldExpr(expr, depth + 1);
-      return true;
     }
     if (bin->op == BinaryOp::Add && hasB && b == 0) { expr = std::move(bin->lhs); return true; }
     else if (bin->op == BinaryOp::Add && hasA && a == 0) { expr = std::move(bin->rhs); return true; }
@@ -329,14 +328,14 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr, int depth) {
           if (inner->op == BinaryOp::Mul) {
             int32_t c = 0;
             if (number(*inner->rhs, c)) {
-              int32_t d = c * b;
+              int32_t d = applyBinary(BinaryOp::Mul, c, b);
               auto x = std::move(inner->lhs);
               expr = std::make_unique<BinaryExpr>(bin->loc, BinaryOp::Mul,
                   std::move(x), std::make_unique<NumberExpr>(bin->loc, d));
               return true;
             }
             if (number(*inner->lhs, c)) {
-              int32_t d = c * b;
+              int32_t d = applyBinary(BinaryOp::Mul, c, b);
               auto x = std::move(inner->rhs);
               expr = std::make_unique<BinaryExpr>(bin->loc, BinaryOp::Mul,
                   std::move(x), std::make_unique<NumberExpr>(bin->loc, d));
@@ -351,8 +350,12 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr, int depth) {
             && number(*inner->rhs, c)) {
           if (bin->op == BinaryOp::Add || bin->op == BinaryOp::Sub) {
             int32_t d = (bin->op == BinaryOp::Add)
-                ? ((inner->op == BinaryOp::Add) ? (c + b) : (b - c))
-                : ((inner->op == BinaryOp::Add) ? (c - b) : (-c - b));
+                ? ((inner->op == BinaryOp::Add)
+                    ? wrap32(static_cast<int64_t>(c) + b)
+                    : wrap32(static_cast<int64_t>(b) - c))
+                : ((inner->op == BinaryOp::Add)
+                    ? wrap32(static_cast<int64_t>(c) - b)
+                    : wrap32(static_cast<int64_t>(-c) - b));
             auto x = std::move(inner->lhs);
             if (d == 0) expr = std::move(x);
             else if (d > 0)
@@ -371,7 +374,9 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr, int depth) {
         int32_t c = 0;
         if ((inner->op == BinaryOp::Add || inner->op == BinaryOp::Sub)
             && number(*inner->rhs, c)) {
-          int32_t d = (inner->op == BinaryOp::Add) ? (a + c) : (a - c);
+          int32_t d = (inner->op == BinaryOp::Add)
+              ? wrap32(static_cast<int64_t>(a) + c)
+              : wrap32(static_cast<int64_t>(a) - c);
           auto x = std::move(inner->lhs);
           if (d == 0) expr = std::move(x);
           else if (d > 0)
@@ -442,9 +447,8 @@ void Optimizer::cseBlock(BlockStmt &block) {
 
 void Optimizer::cseStmt(std::unique_ptr<Stmt> &stmt) {
   if (auto *block = dynamic_cast<BlockStmt *>(stmt.get())) {
-    auto saved = cseMap_;
-    for (auto &s : block->stmts) cseStmt(s);
-    cseMap_ = std::move(saved);
+    cseBlock(*block);
+    cseMap_.clear();
     return;
   }
   if (auto *ifs = dynamic_cast<IfStmt *>(stmt.get())) {
@@ -454,13 +458,12 @@ void Optimizer::cseStmt(std::unique_ptr<Stmt> &stmt) {
       cseMap_ = saved;
       cseStmt(ifs->elseBranch);
     }
-    cseMap_ = std::move(saved);
+    cseMap_.clear();
     return;
   }
   if (auto *wh = dynamic_cast<WhileStmt *>(stmt.get())) {
-    auto saved = cseMap_;
     cseStmt(wh->body);
-    cseMap_ = std::move(saved);
+    cseMap_.clear();
     return;
   }
   if (auto *decl = dynamic_cast<DeclStmt *>(stmt.get())) {
