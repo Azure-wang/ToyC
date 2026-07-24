@@ -19,13 +19,12 @@ private:
   bool foldExpr(std::unique_ptr<Expr> &expr, int depth);
   bool optimizeStmt(std::unique_ptr<Stmt> &stmt);
   bool optimizeStmt(std::unique_ptr<Stmt> &stmt, int depth);
-  bool optimizeBlock(BlockStmt &block);
+  void optimizeBlock(BlockStmt &block);
   bool isTerminator(const Stmt &stmt) const;
   bool number(const Expr &expr, int32_t &value) const;
   int32_t applyUnary(UnaryOp op, int32_t v) const;
   int32_t applyBinary(BinaryOp op, int32_t a, int32_t b) const;
   std::string exprKey(const Expr &expr) const;
-  std::string exprKey(const Expr &expr, int depth) const;
   bool hasCall(const Expr &expr) const;
   void cseBlock(BlockStmt &block);
   void cseStmt(std::unique_ptr<Stmt> &stmt);
@@ -37,6 +36,7 @@ private:
   void hoistLoopInvariants(BlockStmt &block);
   void computeModifiedVars(const Stmt &stmt, std::unordered_set<std::string> &vars) const;
   void collectInnerDecls(const Stmt &stmt, std::unordered_set<std::string> &decls) const;
+  bool isInvariant(const Stmt &stmt, const std::unordered_set<std::string> &mustSet) const;
   bool exprRefsModified(const Expr &expr, const std::unordered_set<std::string> &mustSet) const;
   void collectReadVars(const Expr &expr, std::unordered_set<std::string> &vars) const;
   void collectReadVars(const Stmt &stmt, std::unordered_set<std::string> &vars) const;
@@ -61,15 +61,8 @@ private:
       std::vector<std::pair<std::string, std::unique_ptr<Expr>>> &newTemps,
       int &counter, SourceLoc loc);
 
-  // Value tracking for intra-block constant/copy propagation
-  void invalidateVar(const std::string &name);
-
   ScopedTable<int32_t> constTable_;
   std::unordered_map<std::string, std::string> cseMap_;
-  // valueMap_: mutable variable -> known constant value (intra-block)
-  mutable std::unordered_map<std::string, int32_t> valueMap_;
-  // copyMap_: mutable variable -> source variable name (for copy propagation)
-  std::unordered_map<std::string, std::string> copyMap_;
 };
 
 } // namespace toyc
