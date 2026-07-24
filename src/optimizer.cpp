@@ -416,11 +416,19 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr, int depth) {
       if (bin->op == BinaryOp::Div && a == 0) { expr = std::make_unique<NumberExpr>(bin->loc, 0); return true; }
     }
 
-    // x - x → 0 (same variable)
-    if (bin->op == BinaryOp::Sub) {
-      if (auto *lv = dynamic_cast<VarExpr *>(bin->lhs.get())) {
-        if (auto *rv = dynamic_cast<VarExpr *>(bin->rhs.get())) {
-          if (lv->name == rv->name) { expr = std::make_unique<NumberExpr>(bin->loc, 0); return true; }
+    // x - x → 0, x % x → 0, x == x → 1, etc. — structurally identical operands
+    {
+      std::string lk = exprKey(*bin->lhs, depth);
+      std::string rk = exprKey(*bin->rhs, depth);
+      if (!lk.empty() && lk == rk) {
+        switch (bin->op) {
+        case BinaryOp::Sub: expr = std::make_unique<NumberExpr>(bin->loc, 0); return true;
+        case BinaryOp::Mod: expr = std::make_unique<NumberExpr>(bin->loc, 0); return true;
+        case BinaryOp::Eq: case BinaryOp::Le: case BinaryOp::Ge:
+          expr = std::make_unique<NumberExpr>(bin->loc, 1); return true;
+        case BinaryOp::Ne: case BinaryOp::Lt: case BinaryOp::Gt:
+          expr = std::make_unique<NumberExpr>(bin->loc, 0); return true;
+        default: break;
         }
       }
     }
@@ -556,7 +564,7 @@ std::string Optimizer::exprKey(const Expr &expr, int depth) const {
   return "";
 }
 
-static void invalidateVar(std::unordered_map<std::string, std::string> &m, const std::string &name) {
+static void invalidateCseEntry(std::unordered_map<std::string, std::string> &m, const std::string &name) {
   std::string needle = "\x01V" + name + "\x01";
   for (auto it = m.begin(); it != m.end(); ) {
     if (it->first.find(needle) != std::string::npos || it->second == name)
@@ -598,7 +606,7 @@ void Optimizer::cseStmt(std::unique_ptr<Stmt> &stmt) {
     return;
   }
   if (auto *decl = dynamic_cast<DeclStmt *>(stmt.get())) {
-    invalidateVar(cseMap_, decl->decl.name);
+    invalidateCseEntry(cseMap_, decl->decl.name);
     if (!decl->decl.isConst) {
       std::string key = exprKey(*decl->decl.init);
       if (!key.empty() && cseMap_.count(key))
@@ -608,7 +616,7 @@ void Optimizer::cseStmt(std::unique_ptr<Stmt> &stmt) {
     return;
   }
   if (auto *assign = dynamic_cast<AssignStmt *>(stmt.get())) {
-    invalidateVar(cseMap_, assign->name);
+    invalidateCseEntry(cseMap_, assign->name);
     std::string key = exprKey(*assign->value);
     if (!key.empty() && cseMap_.count(key))
       assign->value = std::make_unique<VarExpr>(assign->value->loc, cseMap_[key]);
