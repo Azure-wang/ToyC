@@ -894,10 +894,29 @@ static bool callsSelf(const Stmt &stmt, const std::string &name) {
   return false;
 }
 
+static bool hasParamShadowing(const Stmt &stmt,
+    const std::unordered_set<std::string> &pnames) {
+  if (auto *block = dynamic_cast<const BlockStmt *>(&stmt)) {
+    for (const auto &s : block->stmts)
+      if (hasParamShadowing(*s, pnames)) return true;
+  } else if (auto *decl = dynamic_cast<const DeclStmt *>(&stmt)) {
+    if (pnames.count(decl->decl.name)) return true;
+  } else if (auto *ifs = dynamic_cast<const IfStmt *>(&stmt)) {
+    if (hasParamShadowing(*ifs->thenBranch, pnames)) return true;
+    if (ifs->elseBranch && hasParamShadowing(*ifs->elseBranch, pnames)) return true;
+  } else if (auto *wh = dynamic_cast<const WhileStmt *>(&stmt)) {
+    if (hasParamShadowing(*wh->body, pnames)) return true;
+  }
+  return false;
+}
+
 bool Optimizer::isInlinable(const Function &fn) {
   if (!fn.body) return false;
   if (fn.body->stmts.empty()) return false;
   if (callsSelf(*fn.body, fn.name)) return false;
+  std::unordered_set<std::string> pnames;
+  for (const auto &p : fn.params) pnames.insert(p.name);
+  if (hasParamShadowing(*fn.body, pnames)) return false;
   int stmtCount = 0;
   for (const auto &s : fn.body->stmts) {
     stmtCount++;
