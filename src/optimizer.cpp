@@ -27,13 +27,9 @@ static std::unique_ptr<Expr> cloneExpr(const Expr &expr) {
 }
 
 void Optimizer::optimize(Program &program) {
-  constTable_.push();
   for (auto &item : program.items) {
     if (auto *decl = dynamic_cast<TopDecl *>(item.get())) {
       foldExpr(decl->decl.init);
-      int32_t v = 0;
-      if (number(*decl->decl.init, v) && decl->decl.isConst)
-        constTable_.declare(decl->decl.name, v);
     }
   }
   for (auto &item : program.items) {
@@ -47,7 +43,6 @@ void Optimizer::optimize(Program &program) {
       optimizeBlock(*fn->func.body);
     }
   }
-  constTable_.pop();
 }
 
 bool Optimizer::optimizeStmt(std::unique_ptr<Stmt> &stmt) {
@@ -62,12 +57,7 @@ bool Optimizer::optimizeStmt(std::unique_ptr<Stmt> &stmt, int depth) {
     return true;
   }
   if (auto *decl = dynamic_cast<DeclStmt *>(stmt.get())) {
-    bool changed = foldExpr(decl->decl.init);
-    if (decl->decl.isConst) {
-      int32_t v = 0;
-      if (number(*decl->decl.init, v)) constTable_.declare(decl->decl.name, v);
-    }
-    return changed;
+    return foldExpr(decl->decl.init);
   }
   if (auto *expr = dynamic_cast<ExprStmt *>(stmt.get())) return foldExpr(expr->expr);
   if (auto *assign = dynamic_cast<AssignStmt *>(stmt.get())) return foldExpr(assign->value);
@@ -75,13 +65,6 @@ bool Optimizer::optimizeStmt(std::unique_ptr<Stmt> &stmt, int depth) {
     bool changed = foldExpr(ifs->cond);
     changed |= optimizeStmt(ifs->thenBranch, depth + 1);
     if (ifs->elseBranch) changed |= optimizeStmt(ifs->elseBranch, depth + 1);
-    int32_t v = 0;
-    if (number(*ifs->cond, v)) {
-      if (v != 0) stmt = std::move(ifs->thenBranch);
-      else if (ifs->elseBranch) stmt = std::move(ifs->elseBranch);
-      else stmt = std::make_unique<EmptyStmt>(ifs->loc);
-      return true;
-    }
     // Remove empty then-branch if no else and condition has no side effects
     if (auto *tb = dynamic_cast<BlockStmt *>(ifs->thenBranch.get())) {
       if (tb->stmts.empty() && !ifs->elseBranch && !hasSideEffects(*ifs->cond)) {
@@ -94,8 +77,6 @@ bool Optimizer::optimizeStmt(std::unique_ptr<Stmt> &stmt, int depth) {
   if (auto *wh = dynamic_cast<WhileStmt *>(stmt.get())) {
     bool changed = foldExpr(wh->cond);
     changed |= optimizeStmt(wh->body, depth + 1);
-    int32_t v = 0;
-    if (number(*wh->cond, v) && v == 0) { stmt = std::make_unique<EmptyStmt>(wh->loc); return true; }
     // Remove empty loop body only if condition has no side effects
     if (auto *b = dynamic_cast<BlockStmt *>(wh->body.get())) {
       if (b->stmts.empty() && !hasSideEffects(*wh->cond)) {
@@ -112,7 +93,6 @@ bool Optimizer::optimizeStmt(std::unique_ptr<Stmt> &stmt, int depth) {
 }
 
 void Optimizer::optimizeBlock(BlockStmt &block) {
-  constTable_.push();
   for (int iter = 0; iter < 5; ++iter) {
     bool changed = false;
     for (auto &stmt : block.stmts)
@@ -128,7 +108,6 @@ void Optimizer::optimizeBlock(BlockStmt &block) {
     block.stmts = std::move(kept);
     if (!changed) break;
   }
-  constTable_.pop();
   hoistCommonSubexprs(block);
   cseBlock(block);
   eliminateDeadStores(block);
@@ -155,14 +134,7 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr) {
 
 bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr, int depth) {
   if (depth > 400) return false;
-  if (auto *var = dynamic_cast<VarExpr *>(expr.get())) {
-    int32_t v = 0;
-    if (number(*var, v)) {
-      expr = std::make_unique<NumberExpr>(var->loc, v);
-      return true;
-    }
-    return false;
-  }
+  if (dynamic_cast<VarExpr *>(expr.get())) return false;
   if (auto *call = dynamic_cast<CallExpr *>(expr.get())) {
     for (auto &arg : call->args) foldExpr(arg, depth + 1);
     return false;
@@ -233,10 +205,6 @@ bool Optimizer::foldExpr(std::unique_ptr<Expr> &expr, int depth) {
     int32_t a = 0, b = 0;
     bool hasA = number(*bin->lhs, a);
     bool hasB = number(*bin->rhs, b);
-    if (hasA && hasB) {
-      expr = std::make_unique<NumberExpr>(bin->loc, applyBinary(bin->op, a, b));
-      return true;
-    }
     if ((bin->op == BinaryOp::Mul || bin->op == BinaryOp::Add) && hasA && !hasB) {
       std::swap(bin->lhs, bin->rhs);
       std::swap(a, b);
@@ -357,10 +325,6 @@ bool Optimizer::number(const Expr &expr, int32_t &value) const {
   if (auto *num = dynamic_cast<const NumberExpr *>(&expr)) {
     value = num->value;
     return true;
-  }
-  if (auto *var = dynamic_cast<const VarExpr *>(&expr)) {
-    auto *v = constTable_.find(var->name);
-    if (v) { value = *v; return true; }
   }
   return false;
 }

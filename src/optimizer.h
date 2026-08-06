@@ -62,7 +62,6 @@ private:
       std::vector<std::pair<std::string, std::unique_ptr<Expr>>> &newTemps,
       int &counter, SourceLoc loc);
 
-  ScopedTable<int32_t> constTable_;
   std::unordered_map<std::string, std::string> cseMap_;
 };
 
