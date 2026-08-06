@@ -79,6 +79,7 @@ private:
   int tempDepth_ = 0;
   int spillBase_ = 0;
   int spillDepth_ = 0;
+  int emitDepth_ = 0;
   bool currentLeaf_ = false;
   std::string currentReturnLabel_;
   std::string currentFnName_;

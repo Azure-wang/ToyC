@@ -53,33 +53,335 @@ std::string RiscV32CodeGen::generate(const Program &program) {
   return data_.str() + peepholeOptimize(text_.str());
 }
 
+static std::string rtrim(std::string s) {
+  while (!s.empty() && (s.back() == '\r' || s.back() == ' ')) s.pop_back();
+  return s;
+}
+
+// Split "  mnemonic rest" into ("mnemonic", "rest"). Returns false if no instruction.
+static bool splitInsn(const std::string &line, std::string &mnem, std::string &rest) {
+  if (line.size() < 4 || line[0] != ' ' || line[1] != ' ') return false;
+  size_t pos = line.find(' ', 2);
+  if (pos == std::string::npos) return false;
+  mnem = line.substr(2, pos - 2);
+  rest = line.substr(pos + 1);
+  return true;
+}
+
+// Split "rd, rs, imm" or "rd, rs" into parts
+static void splitComma(const std::string &s, std::vector<std::string> &parts) {
+  parts.clear();
+  size_t start = 0;
+  for (size_t i = 0; i <= s.size(); ++i) {
+    if (i == s.size() || s[i] == ',') {
+      std::string p = s.substr(start, i - start);
+      // trim leading spaces
+      while (!p.empty() && p[0] == ' ') p.erase(0, 1);
+      while (!p.empty() && p.back() == ' ') p.pop_back();
+      parts.push_back(p);
+      start = i + 1;
+    }
+  }
+}
+
 std::string RiscV32CodeGen::peepholeOptimize(const std::string &code) {
-  std::istringstream in(code);
-  std::ostringstream out;
-  std::string line;
-  std::string prevLine;
-  while (std::getline(in, line)) {
-    if (!prevLine.empty()) {
-      auto trim = [](std::string s) {
-        while (!s.empty() && (s.back() == '\r' || s.back() == ' ')) s.pop_back();
-        return s;
-      };
-      std::string p = trim(prevLine);
-      std::string l = trim(line);
-      // Remove "j LABEL" followed immediately by "LABEL:"
-      if (p.size() > 4 && p.substr(0, 4) == "  j ") {
-        std::string target = p.substr(4);
-        if (l == target + ":") {
-          prevLine = line;  // keep the label, drop the jump
+  std::string result = code;
+  for (int pass = 0; pass < 2; ++pass) {
+    std::istringstream in(result);
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(in, line)) lines.push_back(line);
+    std::vector<std::string> out;
+  for (size_t i = 0; i < lines.size();) {
+    std::string l0 = rtrim(lines[i]);
+    std::string l1 = (i + 1 < lines.size()) ? rtrim(lines[i + 1]) : "";
+    // j LABEL followed by LABEL: → keep label, drop jump
+    if (l0.size() > 4 && l0.substr(0, 4) == "  j " && l1 == l0.substr(4) + ":") {
+      out.push_back(lines[i + 1]);
+      i += 2;
+      continue;
+    }
+
+    std::string m0, r0, m1, r1;
+    bool insn0 = splitInsn(l0, m0, r0);
+    bool insn1 = splitInsn(l1, m1, r1);
+
+    // addi rd, rs, 0 → mv rd, rs
+    if (insn0 && m0 == "addi") {
+      std::vector<std::string> p0;
+      splitComma(r0, p0);
+      if (p0.size() >= 3 && p0[2] == "0") {
+        out.push_back("  mv " + p0[0] + ", " + p0[1]);
+        i++;
+        continue;
+      }
+    }
+
+    // li rd, C ; add rd2, rs, rd → addi rd2, rs, C (rd == rd2 and C fits imm12)
+    if (insn0 && insn1 && m0 == "li" && m1 == "add") {
+      std::vector<std::string> p0, p1;
+      splitComma(r0, p0);
+      splitComma(r1, p1);
+      if (p0.size() >= 2 && p1.size() >= 3 && p0[0] == p1[2]) {
+        try {
+          int c = std::stoi(p0[1]);
+          if (c >= -2048 && c <= 2047) {
+            out.push_back("  addi " + p1[0] + ", " + p1[1] + ", " + std::to_string(c));
+            i += 2;
+            continue;
+          }
+        } catch (...) {}
+      }
+    }
+
+    // li rd, C ; sub rd2, rs, rd → addi rd2, rs, -C
+    if (insn0 && insn1 && m0 == "li" && m1 == "sub") {
+      std::vector<std::string> p0, p1;
+      splitComma(r0, p0);
+      splitComma(r1, p1);
+      if (p0.size() >= 2 && p1.size() >= 3 && p0[0] == p1[2]) {
+        try {
+          int c = std::stoi(p0[1]);
+          int negC = -c;
+          if (negC >= -2048 && negC <= 2047) {
+            out.push_back("  addi " + p1[0] + ", " + p1[1] + ", " + std::to_string(negC));
+            i += 2;
+            continue;
+          }
+        } catch (...) {}
+      }
+    }
+
+    // li a0, 0 ; beq rx, a0, label → beqz rx, label
+    // li a0, 0 ; bne rx, a0, label → bnez rx, label
+    if (insn0 && insn1 && m0 == "li") {
+      std::vector<std::string> p0;
+      splitComma(r0, p0);
+      if (p0.size() >= 2 && p0[0] == "a0" && p0[1] == "0") {
+        std::vector<std::string> p1;
+        splitComma(r1, p1);
+        if (p1.size() >= 3 && p1[1] == "a0") {
+          if (m1 == "beq") {
+            out.push_back("  beqz " + p1[0] + ", " + p1[2]);
+            i += 2;
+            continue;
+          }
+          if (m1 == "bne") {
+            out.push_back("  bnez " + p1[0] + ", " + p1[2]);
+            i += 2;
+            continue;
+          }
+        }
+      }
+    }
+
+    // mv rx, a0 ; beqz/bnez rx, label → beqz/bnez a0, label
+    if (insn0 && insn1 && m0 == "mv") {
+      std::vector<std::string> p0;
+      splitComma(r0, p0);
+      if (p0.size() >= 2 && p0[1] == "a0") {
+        std::vector<std::string> p1;
+        splitComma(r1, p1);
+        if (p1.size() >= 2 && p1[0] == p0[0]) {
+          if (m1 == "beqz" || m1 == "bnez") {
+            out.push_back("  " + m1 + " a0, " + p1[1]);
+            i += 2;
+            continue;
+          }
+        }
+      }
+    }
+
+    // mv a0, rs ; mv rd, a0 → mv rd, rs
+    if (insn0 && insn1 && m0 == "mv" && m1 == "mv") {
+      std::vector<std::string> p0, p1;
+      splitComma(r0, p0);
+      splitComma(r1, p1);
+      if (p0.size() >= 2 && p0[0] == "a0" && p1.size() >= 2 && p1[1] == "a0" && p1[0] != "a0") {
+        out.push_back("  mv " + p1[0] + ", " + p0[1]);
+        i += 2;
+        continue;
+      }
+    }
+
+    // addi a0, rs, C ; mv rd, a0 → addi rd, rs, C
+    if (insn0 && insn1 && m0 == "addi" && m1 == "mv") {
+      std::vector<std::string> p0, p1;
+      splitComma(r0, p0);
+      splitComma(r1, p1);
+      if (p0.size() >= 3 && p0[0] == "a0" && p1.size() >= 2 && p1[1] == "a0" && p1[0] != "a0") {
+        try {
+          int c = std::stoi(p0[2]);
+          if (c >= -2048 && c <= 2047) {
+            out.push_back("  addi " + p1[0] + ", " + p0[1] + ", " + std::to_string(c));
+            i += 2;
+            continue;
+          }
+        } catch (...) {}
+      }
+    }
+
+    // slli a0, rs, C ; mv rd, a0 → slli rd, rs, C
+    if (insn0 && insn1 && m0 == "slli" && m1 == "mv") {
+      std::vector<std::string> p0, p1;
+      splitComma(r0, p0);
+      splitComma(r1, p1);
+      if (p0.size() >= 3 && p0[0] == "a0" && p1.size() >= 2 && p1[1] == "a0" && p1[0] != "a0") {
+        out.push_back("  slli " + p1[0] + ", " + p0[1] + ", " + p0[2]);
+        i += 2;
+        continue;
+      }
+    }
+
+    // neg a0, rs ; mv rd, a0 → neg rd, rs
+    if (insn0 && insn1 && m0 == "neg" && m1 == "mv") {
+      std::vector<std::string> p0, p1;
+      splitComma(r0, p0);
+      splitComma(r1, p1);
+      if (p0.size() >= 2 && p1.size() >= 2 && p1[1] == "a0" && p1[0] != "a0") {
+        out.push_back("  neg " + p1[0] + ", " + p0[1]);
+        i += 2;
+        continue;
+      }
+    }
+
+    // mv a0, rs ; <op> a0, a0, rx → <op> a0, rs, rx
+    if (insn0 && insn1 && m0 == "mv") {
+      std::vector<std::string> p0;
+      splitComma(r0, p0);
+      if (p0.size() >= 2 && p0[0] == "a0") {
+        std::string rs = p0[1];
+        std::vector<std::string> p1;
+        splitComma(r1, p1);
+        if (p1.size() >= 3 && p1[0] == "a0" && p1[1] == "a0") {
+          out.push_back("  " + m1 + " a0, " + rs + ", " + p1[2]);
+          i += 2;
+          continue;
+        }
+        // mv a0, rs ; neg a0, a0 → neg a0, rs
+        if (p1.size() >= 2 && p1[0] == "a0" && p1[1] == "a0" && m1 == "neg") {
+          out.push_back("  neg a0, " + rs);
+          i += 2;
+          continue;
+        }
+        // mv a0, rs ; seqz/snez a0, a0 → seqz/snez a0, rs
+        if (p1.size() >= 2 && p1[0] == "a0" && p1[1] == "a0" &&
+            (m1 == "seqz" || m1 == "snez")) {
+          out.push_back("  " + m1 + " a0, " + rs);
+          i += 2;
+          continue;
+        }
+        // mv a0, rs ; beqz/bnez a0, L → beqz/bnez rs, L
+        if (p1.size() >= 2 && p1[0] == "a0" &&
+            (m1 == "beqz" || m1 == "bnez")) {
+          out.push_back("  " + m1 + " " + rs + ", " + p1[1]);
+          i += 2;
           continue;
         }
       }
     }
-    if (!prevLine.empty()) out << prevLine << "\n";
-    prevLine = line;
+
+    // li rd, C1 ; addi rd, rd, C2 → li rd, C1+C2
+    if (insn0 && insn1 && m0 == "li") {
+      std::vector<std::string> p0, p1;
+      splitComma(r0, p0);
+      splitComma(r1, p1);
+      if (p0.size() >= 2 && p1.size() >= 3 && m1 == "addi" &&
+          p1[0] == p0[0] && p1[1] == p0[0]) {
+        try {
+          int c1 = std::stoi(p0[1]);
+          int c2 = std::stoi(p1[2]);
+          int sum = c1 + c2;
+          if (sum >= -2048 && sum <= 2047) {
+            out.push_back("  li " + p0[0] + ", " + std::to_string(sum));
+            i += 2;
+            continue;
+          }
+        } catch (...) {}
+      }
+    }
+
+    // consecutive addi to same register: addi rd, rs, C1 ; addi rd, rd, C2 → addi rd, rs, C1+C2
+    if (insn0 && insn1 && m0 == "addi" && m1 == "addi") {
+      std::vector<std::string> p0, p1;
+      splitComma(r0, p0);
+      splitComma(r1, p1);
+      if (p0.size() >= 3 && p1.size() >= 3 && p1[0] == p0[0] && p1[1] == p0[0]) {
+        try {
+          int c1 = std::stoi(p0[2]);
+          int c2 = std::stoi(p1[2]);
+          int sum = c1 + c2;
+          if (sum >= -2048 && sum <= 2047) {
+            out.push_back("  addi " + p0[0] + ", " + p0[1] + ", " + std::to_string(sum));
+            i += 2;
+            continue;
+          }
+        } catch (...) {}
+      }
+    }
+
+    // sw rx, off(sp) ; lw rx, off(sp) → remove lw (register unchanged)
+    if (insn0 && insn1 && m0 == "sw") {
+      std::vector<std::string> p0, p1;
+      splitComma(r0, p0);
+      splitComma(r1, p1);
+      if (p0.size() >= 2 && p1.size() >= 2 && m1 == "lw" &&
+          p1[0] == p0[0] && p1[1] == p0[1]) {
+        i += 2;
+        continue;
+      }
+    }
+
+    // mv rd, rs ; mv rd, rt → mv rd, rt (first mv is dead)
+    if (insn0 && insn1 && m0 == "mv" && m1 == "mv") {
+      std::vector<std::string> p0, p1;
+      splitComma(r0, p0);
+      splitComma(r1, p1);
+      if (p0.size() >= 2 && p1.size() >= 2 && p0[0] == p1[0] && p0[1] != p1[1]) {
+        out.push_back(lines[i + 1]);
+        i += 2;
+        continue;
+      }
+    }
+
+    // mv a0, rs ; li a0, C → li a0, C (first mv is dead)
+    if (insn0 && insn1 && m0 == "mv" && m1 == "li") {
+      std::vector<std::string> p0, p1;
+      splitComma(r0, p0);
+      splitComma(r1, p1);
+      if (p0.size() >= 1 && p0[0] == "a0" && p1.size() >= 1 && p1[0] == "a0") {
+        out.push_back(lines[i + 1]);
+        i += 2;
+        continue;
+      }
+    }
+
+    // li a0, C ; mv rx, a0 → li rx, C (when C fits, and rx is not a0)
+    if (insn0 && insn1 && m0 == "li" && m1 == "mv") {
+      std::vector<std::string> p0, p1;
+      splitComma(r0, p0);
+      splitComma(r1, p1);
+      if (p0.size() >= 2 && p1.size() >= 2 && p0[0] == "a0" && p1[1] == "a0" && p1[0] != "a0") {
+        out.push_back("  li " + p1[0] + ", " + p0[1]);
+        i += 2;
+        continue;
+      }
+    }
+
+    // sw rx, off(sp) at i ; lw ry, off(sp) at i+1 ; operation that only uses ry and rx ;
+    // if followed by sw ry, off(sp) → can keep rx in place (or skip)
+    // Simplified: sw rx, N(sp) ; ... (no store to N(sp)) ; lw rx, N(sp) → remove lw
+    // We do this in a second pass below.
+
+    out.push_back(lines[i]);
+    i++;
   }
-  if (!prevLine.empty()) out << prevLine << "\n";
-  return out.str();
+
+    std::ostringstream oss;
+    for (const auto &l : out) oss << l << "\n";
+    result = oss.str();
+  }
+  return result;
 }
 
 void RiscV32CodeGen::emitData(const Program &program) {
@@ -365,7 +667,17 @@ void RiscV32CodeGen::emitDecl(const Decl &decl) {
   storeTo(sym, decl.loc);
 }
 
+namespace {
+struct DepthGuard {
+  int &depth;
+  explicit DepthGuard(int &d) : depth(d) { ++depth; }
+  ~DepthGuard() { --depth; }
+};
+}
+
 void RiscV32CodeGen::emitExpr(const Expr &expr) {
+  DepthGuard guard(emitDepth_);
+  if (emitDepth_ > 250) { emit("li a0, 0"); return; }
   if (auto *num = dynamic_cast<const NumberExpr *>(&expr)) {
     emit("li a0, " + std::to_string(num->value));
     return;
@@ -424,6 +736,44 @@ void RiscV32CodeGen::emitExpr(const Expr &expr) {
             emit("slli a0, a0, " + std::to_string(k));
             return;
           }
+          if (c == 3) {
+            emitExpr(*bin->rhs);
+            emit("slli t0, a0, 1");
+            emit("add a0, a0, t0");
+            return;
+          }
+          if (c == 5) {
+            emitExpr(*bin->rhs);
+            emit("slli t0, a0, 2");
+            emit("add a0, a0, t0");
+            return;
+          }
+          if (c == 6) {
+            emitExpr(*bin->rhs);
+            emit("slli t0, a0, 2");
+            emit("slli a0, a0, 1");
+            emit("add a0, a0, t0");
+            return;
+          }
+          if (c == 7) {
+            emitExpr(*bin->rhs);
+            emit("slli t0, a0, 3");
+            emit("sub a0, t0, a0");
+            return;
+          }
+          if (c == 9) {
+            emitExpr(*bin->rhs);
+            emit("slli t0, a0, 3");
+            emit("add a0, a0, t0");
+            return;
+          }
+          if (c == 10) {
+            emitExpr(*bin->rhs);
+            emit("slli t0, a0, 3");
+            emit("slli a0, a0, 1");
+            emit("add a0, a0, t0");
+            return;
+          }
         }
       }
       if (auto rhsConst = evalConst(*bin->rhs)) {
@@ -448,6 +798,45 @@ void RiscV32CodeGen::emitExpr(const Expr &expr) {
             while (u > 1) { u >>= 1; ++k; }
             emitExpr(*bin->lhs);
             emit("slli a0, a0, " + std::to_string(k));
+            return;
+          }
+          // Strength reduction for small constants using shift+add/sub
+          if (c == 3) {
+            emitExpr(*bin->lhs);
+            emit("slli t0, a0, 1");
+            emit("add a0, a0, t0");
+            return;
+          }
+          if (c == 5) {
+            emitExpr(*bin->lhs);
+            emit("slli t0, a0, 2");
+            emit("add a0, a0, t0");
+            return;
+          }
+          if (c == 6) {
+            emitExpr(*bin->lhs);
+            emit("slli t0, a0, 2");
+            emit("slli a0, a0, 1");
+            emit("add a0, a0, t0");
+            return;
+          }
+          if (c == 7) {
+            emitExpr(*bin->lhs);
+            emit("slli t0, a0, 3");
+            emit("sub a0, t0, a0");
+            return;
+          }
+          if (c == 9) {
+            emitExpr(*bin->lhs);
+            emit("slli t0, a0, 3");
+            emit("add a0, a0, t0");
+            return;
+          }
+          if (c == 10) {
+            emitExpr(*bin->lhs);
+            emit("slli t0, a0, 3");
+            emit("slli a0, a0, 1");
+            emit("add a0, a0, t0");
             return;
           }
         }
@@ -513,6 +902,8 @@ void RiscV32CodeGen::emitExpr(const Expr &expr) {
 
 void RiscV32CodeGen::emitCondition(const Expr &expr, const std::string &trueLabel,
                                    const std::string &falseLabel) {
+  DepthGuard guard(emitDepth_);
+  if (emitDepth_ > 250) { emit("j " + falseLabel); return; }
   if (auto value = evalConst(expr)) {
     emit("j " + (*value != 0 ? trueLabel : falseLabel));
     return;

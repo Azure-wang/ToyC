@@ -2,25 +2,27 @@
 
 #include "utils.h"
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_set>
 
 namespace toyc {
 
-static std::unique_ptr<Expr> cloneExpr(const Expr &expr) {
+static std::unique_ptr<Expr> cloneExpr(const Expr &expr, int depth = 0) {
+  if (depth > 200) return std::make_unique<NumberExpr>(expr.loc, 0);
   if (auto *num = dynamic_cast<const NumberExpr *>(&expr))
     return std::make_unique<NumberExpr>(num->loc, num->value);
   if (auto *var = dynamic_cast<const VarExpr *>(&expr))
     return std::make_unique<VarExpr>(var->loc, var->name);
   if (auto *un = dynamic_cast<const UnaryExpr *>(&expr))
-    return std::make_unique<UnaryExpr>(un->loc, un->op, cloneExpr(*un->operand));
+    return std::make_unique<UnaryExpr>(un->loc, un->op, cloneExpr(*un->operand, depth + 1));
   if (auto *bin = dynamic_cast<const BinaryExpr *>(&expr))
     return std::make_unique<BinaryExpr>(bin->loc, bin->op,
-        cloneExpr(*bin->lhs), cloneExpr(*bin->rhs));
+        cloneExpr(*bin->lhs, depth + 1), cloneExpr(*bin->rhs, depth + 1));
   if (auto *call = dynamic_cast<const CallExpr *>(&expr)) {
     std::vector<std::unique_ptr<Expr>> args;
-    for (const auto &a : call->args) args.push_back(cloneExpr(*a));
+    for (const auto &a : call->args) args.push_back(cloneExpr(*a, depth + 1));
     return std::make_unique<CallExpr>(call->loc, call->callee, std::move(args));
   }
   return nullptr;
@@ -28,9 +30,11 @@ static std::unique_ptr<Expr> cloneExpr(const Expr &expr) {
 
 void Optimizer::optimize(Program &program) {
   constTable_.push();
+  varNames_.push();
   for (auto &item : program.items) {
     if (auto *decl = dynamic_cast<TopDecl *>(item.get())) {
       foldExpr(decl->decl.init);
+      varNames_.declare(decl->decl.name, true);
       int32_t v = 0;
       if (number(*decl->decl.init, v) && decl->decl.isConst)
         constTable_.declare(decl->decl.name, v);
@@ -38,16 +42,26 @@ void Optimizer::optimize(Program &program) {
   }
   for (auto &item : program.items) {
     if (auto *fn = dynamic_cast<TopFunction *>(item.get())) {
-      optimizeBlock(*fn->func.body);
+      varNames_.declare(fn->func.name, true);
+      varNames_.push();
+      for (const auto &p : fn->func.params)
+        varNames_.declare(p.name, true);
+      optimizeBlock(*fn->func.body, true);
+      varNames_.pop();
     }
   }
   inlineCalls(program);
   for (auto &item : program.items) {
     if (auto *fn = dynamic_cast<TopFunction *>(item.get())) {
-      optimizeBlock(*fn->func.body);
+      varNames_.push();
+      for (const auto &p : fn->func.params)
+        varNames_.declare(p.name, true);
+      optimizeBlock(*fn->func.body, true);
+      varNames_.pop();
     }
   }
   constTable_.pop();
+  varNames_.pop();
 }
 
 bool Optimizer::optimizeStmt(std::unique_ptr<Stmt> &stmt) {
@@ -62,6 +76,7 @@ bool Optimizer::optimizeStmt(std::unique_ptr<Stmt> &stmt, int depth) {
     return true;
   }
   if (auto *decl = dynamic_cast<DeclStmt *>(stmt.get())) {
+    varNames_.declare(decl->decl.name, true);
     bool changed = foldExpr(decl->decl.init);
     if (decl->decl.isConst) {
       int32_t v = 0;
@@ -129,14 +144,18 @@ bool Optimizer::optimizeStmt(std::unique_ptr<Stmt> &stmt, int depth) {
   return false;
 }
 
-void Optimizer::optimizeBlock(BlockStmt &block) {
+void Optimizer::optimizeBlock(BlockStmt &block, bool isFunctionBody) {
   constTable_.push();
+  varNames_.push();
   auto savedValueMap = std::move(valueMap_);
   valueMap_.clear();
   for (int iter = 0; iter < 5; ++iter) {
     bool changed = false;
-    for (auto &stmt : block.stmts)
+    for (auto &stmt : block.stmts) {
+      if (auto *decl = dynamic_cast<DeclStmt *>(stmt.get()))
+        varNames_.declare(decl->decl.name, true);
       changed |= optimizeStmt(stmt);
+    }
     std::vector<std::unique_ptr<Stmt>> kept;
     bool dead = false;
     for (auto &stmt : block.stmts) {
@@ -149,10 +168,15 @@ void Optimizer::optimizeBlock(BlockStmt &block) {
     if (!changed) break;
   }
   constTable_.pop();
+  propagateCopies(block);
   hoistCommonSubexprs(block);
   cseBlock(block);
-  eliminateDeadStores(block);
+  // Only run dead store elimination at function body level to avoid
+  // removing stores in nested blocks that are live in outer scopes.
+  if (isFunctionBody) eliminateDeadStores(block);
   hoistLoopInvariants(block);
+  strengthReduce(block, nextCseId_);
+  varNames_.pop();
   valueMap_ = std::move(savedValueMap);
 }
 
@@ -630,11 +654,10 @@ bool Optimizer::hoistInStmt(std::unique_ptr<Stmt> &stmt, int &cseCounter,
 }
 
 void Optimizer::hoistCommonSubexprs(BlockStmt &block) {
-  int cseCounter = 0;
   std::vector<std::unique_ptr<Stmt>> newStmts;
   for (auto &stmt : block.stmts) {
     std::vector<std::unique_ptr<Stmt>> preStmts;
-    hoistInStmt(stmt, cseCounter, preStmts);
+    hoistInStmt(stmt, nextCseId_, preStmts);
     for (auto &pre : preStmts)
       newStmts.push_back(std::move(pre));
     newStmts.push_back(std::move(stmt));
@@ -686,6 +709,80 @@ void Optimizer::collectReadVars(const Stmt &stmt,
   } else if (auto *ret = dynamic_cast<const ReturnStmt *>(&stmt)) {
     if (ret->value) collectReadVars(*ret->value, vars);
   }
+}
+
+// Copy propagation within a basic block.
+// After "x = y" (where y is a simple variable), replace subsequent uses of x
+// with y until either x or y is reassigned.
+void Optimizer::propagateCopies(BlockStmt &block) {
+  std::unordered_map<std::string, std::string> copyMap;
+
+  auto invalidateSource = [&](const std::string &name) {
+    for (auto it = copyMap.begin(); it != copyMap.end(); ) {
+      if (it->second == name) it = copyMap.erase(it);
+      else ++it;
+    }
+  };
+
+  std::function<void(Expr &)> replaceInExpr;
+  replaceInExpr = [&](Expr &expr) {
+    if (auto *var = dynamic_cast<VarExpr *>(&expr)) {
+      auto it = copyMap.find(var->name);
+      if (it != copyMap.end()) var->name = it->second;
+    } else if (auto *un = dynamic_cast<UnaryExpr *>(&expr)) {
+      replaceInExpr(*un->operand);
+    } else if (auto *bin = dynamic_cast<BinaryExpr *>(&expr)) {
+      replaceInExpr(*bin->lhs);
+      replaceInExpr(*bin->rhs);
+    } else if (auto *call = dynamic_cast<CallExpr *>(&expr)) {
+      for (auto &arg : call->args) replaceInExpr(*arg);
+    }
+  };
+
+  std::function<void(Stmt &)> processStmt;
+  processStmt = [&](Stmt &stmt) {
+    if (auto *inner = dynamic_cast<BlockStmt *>(&stmt)) {
+      auto saved = copyMap;
+      for (auto &s : inner->stmts) processStmt(*s);
+      copyMap = std::move(saved);
+    } else if (auto *ifs = dynamic_cast<IfStmt *>(&stmt)) {
+      replaceInExpr(*ifs->cond);
+      auto saved = copyMap;
+      processStmt(*ifs->thenBranch);
+      if (ifs->elseBranch) {
+        copyMap = saved;
+        processStmt(*ifs->elseBranch);
+      }
+      copyMap.clear();
+    } else if (auto *wh = dynamic_cast<WhileStmt *>(&stmt)) {
+      replaceInExpr(*wh->cond);
+      auto saved = copyMap;
+      processStmt(*wh->body);
+      copyMap = std::move(saved);
+    } else if (auto *decl = dynamic_cast<DeclStmt *>(&stmt)) {
+      replaceInExpr(*decl->decl.init);
+      copyMap.erase(decl->decl.name);
+      invalidateSource(decl->decl.name);
+      if (auto *var = dynamic_cast<VarExpr *>(decl->decl.init.get())) {
+        if (var->name != decl->decl.name)
+          copyMap[decl->decl.name] = var->name;
+      }
+    } else if (auto *assign = dynamic_cast<AssignStmt *>(&stmt)) {
+      replaceInExpr(*assign->value);
+      copyMap.erase(assign->name);
+      invalidateSource(assign->name);
+      if (auto *var = dynamic_cast<VarExpr *>(assign->value.get())) {
+        if (var->name != assign->name)
+          copyMap[assign->name] = var->name;
+      }
+    } else if (auto *es = dynamic_cast<ExprStmt *>(&stmt)) {
+      replaceInExpr(*es->expr);
+    } else if (auto *ret = dynamic_cast<ReturnStmt *>(&stmt)) {
+      if (ret->value) replaceInExpr(*ret->value);
+    }
+  };
+
+  for (auto &stmt : block.stmts) processStmt(*stmt);
 }
 
 void Optimizer::eliminateDeadStores(BlockStmt &block) {
@@ -830,7 +927,8 @@ void Optimizer::hoistLoopInvariants(BlockStmt &block) {
         if (auto *decl = dynamic_cast<const DeclStmt *>(bs.get())) {
           inv = !exprRefsModified(*decl->decl.init, mustSet)
               && assignedSet.count(decl->decl.name) == 0
-              && outerDecls.count(decl->decl.name) == 0;
+              && outerDecls.count(decl->decl.name) == 0
+              && varNames_.findParent(decl->decl.name) == nullptr;
         } else if (auto *assign = dynamic_cast<const AssignStmt *>(bs.get())) {
           inv = !exprRefsModified(*assign->value, mustSet)
               && mustSet.count(assign->name) == 0;
@@ -845,6 +943,331 @@ void Optimizer::hoistLoopInvariants(BlockStmt &block) {
       }
       body->stmts = std::move(keptBody);
       hoistLoopInvariants(*body);
+    }
+    newStmts.push_back(std::move(stmt));
+  }
+  block.stmts = std::move(newStmts);
+}
+
+// ─── Strength reduction for induction variables ──────────────────
+
+// Helper: check if expr is a VarExpr referencing the given name
+static bool isVarRef(const Expr &expr, const std::string &name) {
+  auto *v = dynamic_cast<const VarExpr *>(&expr);
+  return v && v->name == name;
+}
+
+// Helper: check if expr is x * M where x is the induction variable
+// Returns M (the multiplier) or 0 if not matching
+static int isMulByVar(const Expr &expr, const std::string &name) {
+  auto *bin = dynamic_cast<const BinaryExpr *>(&expr);
+  if (!bin || bin->op != BinaryOp::Mul) return 0;
+  if (auto *num = dynamic_cast<NumberExpr *>(bin->rhs.get())) {
+    if (isVarRef(*bin->lhs, name)) return static_cast<int>(num->value);
+  }
+  if (auto *num = dynamic_cast<NumberExpr *>(bin->lhs.get())) {
+    if (isVarRef(*bin->rhs, name)) return static_cast<int>(num->value);
+  }
+  return 0;
+}
+
+// Helper: check if expr is x * M + D where x is induction variable
+// Returns M, and sets D via out param. Returns 0 if not matching.
+static int matchLinearExpr(const Expr &expr, const std::string &name, int32_t &d) {
+  // x * M
+  int m = isMulByVar(expr, name);
+  if (m != 0) { d = 0; return m; }
+  // x * M + D or D + x * M
+  auto *bin = dynamic_cast<const BinaryExpr *>(&expr);
+  if (!bin || bin->op != BinaryOp::Add) return 0;
+  // Try: (x * M) + D
+  m = isMulByVar(*bin->lhs, name);
+  if (m != 0) {
+    if (auto *num = dynamic_cast<NumberExpr *>(bin->rhs.get())) {
+      d = num->value;
+      return m;
+    }
+  }
+  // Try: D + (x * M)
+  m = isMulByVar(*bin->rhs, name);
+  if (m != 0) {
+    if (auto *num = dynamic_cast<NumberExpr *>(bin->lhs.get())) {
+      d = num->value;
+      return m;
+    }
+  }
+  // Try: x + D (M=1)
+  if (bin->op == BinaryOp::Add) {
+    if (isVarRef(*bin->lhs, name)) {
+      if (auto *num = dynamic_cast<NumberExpr *>(bin->rhs.get())) {
+        d = num->value; return 1;
+      }
+    }
+    if (isVarRef(*bin->rhs, name)) {
+      if (auto *num = dynamic_cast<NumberExpr *>(bin->lhs.get())) {
+        d = num->value; return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+// Replace all references to the induction-var-based expression with _sr name
+static void replaceInductionExpr(Expr &expr, const std::string &ivName,
+    const std::string &srName, int m, int32_t d) {
+  if (isVarRef(expr, ivName)) {
+    // Don't replace bare variable refs — only matched through matchLinearExpr
+    return;
+  }
+  // Check if this expr matches the linear pattern
+  int32_t cd = 0;
+  int cm = matchLinearExpr(expr, ivName, cd);
+  if (cm == m && cd == d) {
+    // Can't replace in-place since expr is a reference; handled at caller level
+    return;
+  }
+  // Recurse
+  if (auto *un = dynamic_cast<UnaryExpr *>(&expr))
+    replaceInductionExpr(*un->operand, ivName, srName, m, d);
+  else if (auto *bin = dynamic_cast<BinaryExpr *>(&expr)) {
+    replaceInductionExpr(*bin->lhs, ivName, srName, m, d);
+    replaceInductionExpr(*bin->rhs, ivName, srName, m, d);
+  } else if (auto *call = dynamic_cast<CallExpr *>(&expr)) {
+    for (auto &arg : call->args)
+      replaceInductionExpr(*arg, ivName, srName, m, d);
+  }
+}
+
+// Replace matching linear expressions in a statement
+static void replaceInStmt(std::unique_ptr<Stmt> &stmt, const std::string &ivName,
+    const std::string &srName, int m, int32_t d) {
+  if (auto *block = dynamic_cast<BlockStmt *>(stmt.get())) {
+    for (auto &s : block->stmts)
+      replaceInStmt(s, ivName, srName, m, d);
+  } else if (auto *decl = dynamic_cast<DeclStmt *>(stmt.get())) {
+    int32_t cd = 0;
+    if (matchLinearExpr(*decl->decl.init, ivName, cd) == m && cd == d) {
+      decl->decl.init = std::make_unique<VarExpr>(decl->decl.loc, srName);
+    } else {
+      replaceInductionExpr(*decl->decl.init, ivName, srName, m, d);
+    }
+  } else if (auto *assign = dynamic_cast<AssignStmt *>(stmt.get())) {
+    // Don't replace induction variable increment itself
+    if (assign->name != ivName) {
+      int32_t cd = 0;
+      if (matchLinearExpr(*assign->value, ivName, cd) == m && cd == d) {
+        assign->value = std::make_unique<VarExpr>(assign->value->loc, srName);
+      } else {
+        replaceInductionExpr(*assign->value, ivName, srName, m, d);
+      }
+    }
+  } else if (auto *es = dynamic_cast<ExprStmt *>(stmt.get())) {
+    int32_t cd = 0;
+    if (matchLinearExpr(*es->expr, ivName, cd) == m && cd == d) {
+      es->expr = std::make_unique<VarExpr>(es->expr->loc, srName);
+    } else {
+      replaceInductionExpr(*es->expr, ivName, srName, m, d);
+    }
+  } else if (auto *ifs = dynamic_cast<IfStmt *>(stmt.get())) {
+    int32_t cd = 0;
+    if (matchLinearExpr(*ifs->cond, ivName, cd) == m && cd == d) {
+      ifs->cond = std::make_unique<VarExpr>(ifs->cond->loc, srName);
+    } else {
+      replaceInductionExpr(*ifs->cond, ivName, srName, m, d);
+    }
+    replaceInStmt(ifs->thenBranch, ivName, srName, m, d);
+    if (ifs->elseBranch) replaceInStmt(ifs->elseBranch, ivName, srName, m, d);
+  } else if (auto *wh = dynamic_cast<WhileStmt *>(stmt.get())) {
+    int32_t cd = 0;
+    if (matchLinearExpr(*wh->cond, ivName, cd) == m && cd == d) {
+      wh->cond = std::make_unique<VarExpr>(wh->cond->loc, srName);
+    } else {
+      replaceInductionExpr(*wh->cond, ivName, srName, m, d);
+    }
+    replaceInStmt(wh->body, ivName, srName, m, d);
+  } else if (auto *ret = dynamic_cast<ReturnStmt *>(stmt.get())) {
+    if (ret->value) {
+      int32_t cd = 0;
+      if (matchLinearExpr(*ret->value, ivName, cd) == m && cd == d) {
+        ret->value = std::make_unique<VarExpr>(ret->value->loc, srName);
+      } else {
+        replaceInductionExpr(*ret->value, ivName, srName, m, d);
+      }
+    }
+  }
+}
+
+void Optimizer::strengthReduce(BlockStmt &block, int &counter) {
+  // Process inner blocks/loops first (bottom-up)
+  for (auto &stmt : block.stmts) {
+    if (auto *ifs = dynamic_cast<IfStmt *>(stmt.get())) {
+      if (auto *b = dynamic_cast<BlockStmt *>(ifs->thenBranch.get()))
+        strengthReduce(*b, counter);
+      if (ifs->elseBranch)
+        if (auto *b = dynamic_cast<BlockStmt *>(ifs->elseBranch.get()))
+          strengthReduce(*b, counter);
+    } else if (auto *inner = dynamic_cast<BlockStmt *>(stmt.get())) {
+      strengthReduce(*inner, counter);
+    }
+  }
+
+  std::vector<std::unique_ptr<Stmt>> newStmts;
+  for (auto &stmt : block.stmts) {
+    if (auto *wh = dynamic_cast<WhileStmt *>(stmt.get())) {
+      auto *body = dynamic_cast<BlockStmt *>(wh->body.get());
+      if (!body) { newStmts.push_back(std::move(stmt)); continue; }
+
+      // Find induction variable: var = var + 1 (stride 1)
+      std::string ivName;
+      int ivStride = 0;
+      for (auto &bs : body->stmts) {
+        if (auto *assign = dynamic_cast<AssignStmt *>(bs.get())) {
+          auto *add = dynamic_cast<BinaryExpr *>(assign->value.get());
+          if (add && add->op == BinaryOp::Add) {
+            if (isVarRef(*add->lhs, assign->name)) {
+              if (auto *num = dynamic_cast<NumberExpr *>(add->rhs.get())) {
+                ivName = assign->name;
+                ivStride = num->value;
+                break;
+              }
+            }
+          }
+        }
+      }
+      if (ivName.empty() || ivStride == 0) {
+        newStmts.push_back(std::move(stmt));
+        continue;
+      }
+
+      // Find linear expressions of the form iv * M + D used in the loop
+      std::unordered_set<std::string> seenExprs;
+      struct LinearUse {
+        int m;
+        int32_t d;
+        int count;
+      };
+      std::vector<LinearUse> uses;
+
+      // Count occurrences of each linear expression
+      std::function<void(const Stmt &)> countUses;
+      countUses = [&](const Stmt &s) {
+        if (auto *blk = dynamic_cast<const BlockStmt *>(&s)) {
+          for (auto &ss : blk->stmts) countUses(*ss);
+        } else if (auto *ifs = dynamic_cast<const IfStmt *>(&s)) {
+          int32_t cd = 0;
+          int cm = matchLinearExpr(*ifs->cond, ivName, cd);
+          if (cm > 0) {
+            std::string key = std::to_string(cm) + "_" + std::to_string(cd);
+            bool found = false;
+            for (auto &u : uses) {
+              if (u.m == cm && u.d == cd) { u.count++; found = true; break; }
+            }
+            if (!found) uses.push_back({cm, cd, 1});
+          }
+          countUses(*ifs->thenBranch);
+          if (ifs->elseBranch) countUses(*ifs->elseBranch);
+        } else if (auto *wh2 = dynamic_cast<const WhileStmt *>(&s)) {
+          int32_t cd = 0;
+          int cm = matchLinearExpr(*wh2->cond, ivName, cd);
+          if (cm > 0) {
+            bool found = false;
+            for (auto &u : uses) {
+              if (u.m == cm && u.d == cd) { u.count++; found = true; break; }
+            }
+            if (!found) uses.push_back({cm, cd, 1});
+          }
+          countUses(*wh2->body);
+        } else if (auto *assign = dynamic_cast<const AssignStmt *>(&s)) {
+          if (assign->name != ivName) {
+            int32_t cd = 0;
+            int cm = matchLinearExpr(*assign->value, ivName, cd);
+            if (cm > 0) {
+              bool found = false;
+              for (auto &u : uses) {
+                if (u.m == cm && u.d == cd) { u.count++; found = true; break; }
+              }
+              if (!found) uses.push_back({cm, cd, 1});
+            }
+          }
+        } else if (auto *decl = dynamic_cast<const DeclStmt *>(&s)) {
+          int32_t cd = 0;
+          int cm = matchLinearExpr(*decl->decl.init, ivName, cd);
+          if (cm > 0) {
+            bool found = false;
+            for (auto &u : uses) {
+              if (u.m == cm && u.d == cd) { u.count++; found = true; break; }
+            }
+            if (!found) uses.push_back({cm, cd, 1});
+          }
+        } else if (auto *es = dynamic_cast<const ExprStmt *>(&s)) {
+          int32_t cd = 0;
+          int cm = matchLinearExpr(*es->expr, ivName, cd);
+          if (cm > 0) {
+            bool found = false;
+            for (auto &u : uses) {
+              if (u.m == cm && u.d == cd) { u.count++; found = true; break; }
+            }
+            if (!found) uses.push_back({cm, cd, 1});
+          }
+        } else if (auto *ret = dynamic_cast<const ReturnStmt *>(&s)) {
+          if (ret->value) {
+            int32_t cd = 0;
+            int cm = matchLinearExpr(*ret->value, ivName, cd);
+            if (cm > 0) {
+              bool found = false;
+              for (auto &u : uses) {
+                if (u.m == cm && u.d == cd) { u.count++; found = true; break; }
+              }
+              if (!found) uses.push_back({cm, cd, 1});
+            }
+          }
+        }
+      };
+      countUses(*wh->body);
+
+      // For each linear expression used 2+ times (or in a loop), create a strength-reduced variable
+      for (auto &use : uses) {
+        if (use.count < 1) continue;
+        std::string srName = "_sr_" + std::to_string(counter++);
+        int stride = use.m * ivStride;
+
+        // Create init statement before the loop: int _sr_N = iv * m + d;
+        auto initMul = std::make_unique<BinaryExpr>(wh->loc, BinaryOp::Mul,
+            std::make_unique<VarExpr>(wh->loc, ivName),
+            std::make_unique<NumberExpr>(wh->loc, use.m));
+        std::unique_ptr<Expr> initExpr;
+        if (use.d != 0)
+          initExpr = std::make_unique<BinaryExpr>(wh->loc, BinaryOp::Add,
+              std::move(initMul), std::make_unique<NumberExpr>(wh->loc, use.d));
+        else
+          initExpr = std::move(initMul);
+        Decl initDecl;
+        initDecl.loc = wh->loc;
+        initDecl.name = srName;
+        initDecl.init = std::move(initExpr);
+        newStmts.push_back(std::make_unique<DeclStmt>(wh->loc, std::move(initDecl)));
+
+        // Replace uses in loop body
+        replaceInStmt(wh->body, ivName, srName, use.m, use.d);
+
+        // Add increment after the induction variable update
+        // Find the iv update statement and add sr increment after it
+        std::vector<std::unique_ptr<Stmt>> newBody;
+        for (auto &bs : body->stmts) {
+          newBody.push_back(std::move(bs));
+          if (auto *assign = dynamic_cast<AssignStmt *>(newBody.back().get())) {
+            if (assign->name == ivName) {
+              auto srUpdate = std::make_unique<BinaryExpr>(wh->loc, BinaryOp::Add,
+                  std::make_unique<VarExpr>(wh->loc, srName),
+                  std::make_unique<NumberExpr>(wh->loc, stride));
+              AssignStmt srAssign(wh->loc, srName, std::move(srUpdate));
+              newBody.push_back(std::make_unique<AssignStmt>(std::move(srAssign)));
+            }
+          }
+        }
+        body->stmts = std::move(newBody);
+      }
+      strengthReduce(*body, counter);
     }
     newStmts.push_back(std::move(stmt));
   }

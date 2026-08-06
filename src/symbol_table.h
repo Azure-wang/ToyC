@@ -29,8 +29,26 @@ public:
     return nullptr;
   }
 
+  T *findParent(const std::string &name) {
+    if (scopes_.size() < 2) return nullptr;
+    for (auto it = scopes_.rbegin() + 1; it != scopes_.rend(); ++it) {
+      auto f = it->find(name);
+      if (f != it->end()) return &f->second;
+    }
+    return nullptr;
+  }
+
   const T *find(const std::string &name) const {
     for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
+      auto f = it->find(name);
+      if (f != it->end()) return &f->second;
+    }
+    return nullptr;
+  }
+
+  const T *findParent(const std::string &name) const {
+    if (scopes_.size() < 2) return nullptr;
+    for (auto it = scopes_.rbegin() + 1; it != scopes_.rend(); ++it) {
       auto f = it->find(name);
       if (f != it->end()) return &f->second;
     }
