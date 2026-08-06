@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make -j4)",
+      "Read(//c/Program Files/CMake/bin/**)",
+      "Read(//c/msys64/mingw64/bin/**)",
+      "Read(//c/msys64/usr/bin/**)",
+      "Bash(./build/toyc_new.exe -opt)",
+      "Bash(./build/toyc.exe -opt)",
+      "Bash(./build/toyc.exe)"
+    ]
+  }
+}

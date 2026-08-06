@@ -19,7 +19,7 @@ private:
   bool foldExpr(std::unique_ptr<Expr> &expr, int depth);
   bool optimizeStmt(std::unique_ptr<Stmt> &stmt);
   bool optimizeStmt(std::unique_ptr<Stmt> &stmt, int depth);
-  void optimizeBlock(BlockStmt &block, bool isFunctionBody = false);
+  void optimizeBlock(BlockStmt &block);
   bool isTerminator(const Stmt &stmt) const;
   bool number(const Expr &expr, int32_t &value) const;
   int32_t applyUnary(UnaryOp op, int32_t v) const;
@@ -34,9 +34,7 @@ private:
       std::vector<std::unique_ptr<Stmt>> &preStmts);
   void countSubexprs(const Expr &expr, std::unordered_map<std::string, int> &counts) const;
   void eliminateDeadStores(BlockStmt &block);
-  void propagateCopies(BlockStmt &block);
   void hoistLoopInvariants(BlockStmt &block);
-  void strengthReduce(BlockStmt &block, int &counter);
   void computeModifiedVars(const Stmt &stmt, std::unordered_set<std::string> &vars) const;
   void collectInnerDecls(const Stmt &stmt, std::unordered_set<std::string> &decls) const;
   bool isInvariant(const Stmt &stmt, const std::unordered_set<std::string> &mustSet) const;
@@ -64,9 +62,8 @@ private:
       std::vector<std::pair<std::string, std::unique_ptr<Expr>>> &newTemps,
       int &counter, SourceLoc loc);
 
-  ScopedTable<bool> varNames_;
+  ScopedTable<int32_t> constTable_;
   std::unordered_map<std::string, std::string> cseMap_;
-  int nextCseId_ = 0;
 };
 
 } // namespace toyc
